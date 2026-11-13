@@ -5,6 +5,9 @@ var OPERATIONS = ['list_accounts', 'list_mailboxes', 'list_messages', 'read_mess
   'show_message', 'show_draft'];
 var MAX_BOXES = 1000;
 var MAX_BODY_BYTES = 20 * 1024 * 1024;
+var MAX_SCAN = 200;
+var HEADER_BATCH_SIZE = 10;
+var SEARCH_BUDGET_MS = 10000;
 
 function requireValue(condition, message) {
   if (!condition) {
@@ -91,6 +94,9 @@ function boxIdentity(box) {
   var path = [box.name()];
   var parent = box.container();
   while (parent) {
+    // Mail returns an account container, not null, at the top of a mailbox path.
+    if (account && Automation.getDisplayString(parent) === Automation.getDisplayString(account)) break;
+    if (!account && !parent.exists()) break;
     requireValue(path.length < 20, 'Mailbox hierarchy too deep');
     path = [parent.name()].concat(path);
     parent = parent.container();
@@ -103,22 +109,16 @@ function sameBox(box, accountId, path) {
   return identity.account_id === accountId && JSON.stringify(identity.mailbox) === JSON.stringify(path);
 }
 
-function roots(mail, accountId) {
+function accountBoxes(mail, accountId) {
   var boxes = accountId === '__local__' ? mail.mailboxes() : accountFor(mail, accountId).mailboxes();
   requireValue(boxes.length <= MAX_BOXES, 'Mailbox hierarchy too large');
   return boxes.filter(function (box) { return boxIdentity(box).account_id === accountId; });
 }
 
 function boxFor(mail, accountId, path) {
-  var boxes = roots(mail, accountId);
-  var box;
-  path.forEach(function (part, index) {
-    box = one(boxes.filter(function (candidate) { return candidate.name() === part; }), 'Mailbox');
-    if (index < path.length - 1) {
-      boxes = box.mailboxes();
-      requireValue(boxes.length <= MAX_BOXES, 'Mailbox hierarchy too large');
-    }
-  });
+  var box = one(accountBoxes(mail, accountId).filter(function (candidate) {
+    return sameBox(candidate, accountId, path);
+  }), 'Mailbox');
   requireValue(sameBox(box, accountId, path), 'Mailbox identity changed');
   return box;
 }
@@ -139,48 +139,71 @@ function listAccounts(mail) {
 }
 
 function listMailboxes(mail, args) {
-  var result = [];
-  function visit(boxes, prefix) {
-    requireValue(prefix.length < 20 || boxes.length === 0, 'Mailbox hierarchy too deep');
-    boxes.forEach(function (box) {
-      requireValue(result.length < MAX_BOXES, 'Mailbox hierarchy too large');
-      var path = prefix.concat([box.name()]);
-      requireValue(sameBox(box, args.account_id, path), 'Mailbox identity changed');
-      result = result.concat([{ account_id: args.account_id, path: path, unread_count: box.unreadCount() }]);
-      visit(box.mailboxes(), path);
-    });
-  }
-  visit(roots(mail, args.account_id), []);
+  var result = accountBoxes(mail, args.account_id).map(function (box) {
+    var identity = boxIdentity(box);
+    requireValue(identity.account_id === args.account_id, 'Mailbox identity changed');
+    return { account_id: args.account_id, path: identity.mailbox, unread_count: box.unreadCount() };
+  });
   return { mailboxes: result };
 }
 
 function summary(message, args) {
-  requireValue(sameBox(message.mailbox(), args.account_id, args.mailbox), 'Message mailbox is stale');
-  return { ref: { account_id: args.account_id, mailbox: args.mailbox,
+  var identity = boxIdentity(message.mailbox());
+  requireValue(identity.account_id === args.account_id, 'Message account changed');
+  // Gmail label views can enumerate a message whose owning mailbox is All Mail.
+  return { ref: { account_id: args.account_id, mailbox: identity.mailbox,
     message_id: message.id(), header_message_id: message.messageId() },
   subject: message.subject(), sender: message.sender(), date_received: message.dateReceived().toISOString(),
   read: message.readStatus(), flagged: message.flaggedStatus() };
 }
 
+function headerBatch(box, start, end) {
+  // JXA ranges have an inclusive end; fetch only headers from this bounded window.
+  var window = box.messages.slice(start, end - 1);
+  var subjects = window.subject();
+  var senders = window.sender();
+  requireValue(Array.isArray(subjects) && Array.isArray(senders) &&
+    subjects.length === end - start && senders.length === subjects.length &&
+    subjects.concat(senders).every(function (value) { return typeof value === 'string'; }),
+  'Mailbox changed while searching; list messages again');
+  return { subjects: subjects, senders: senders };
+}
+
 function listMessages(mail, args) {
+  var deadline = Date.now() + SEARCH_BUDGET_MS;
   var box = boxFor(mail, args.account_id, args.mailbox);
   var total = box.messages.length;
   var index = Math.min(args.offset, total);
   var scanned = 0;
   var found = [];
   var query = args.query.toLowerCase();
-  while (index < total && scanned < 200 && found.length < args.limit) {
+  var batch;
+  var batchStart = index;
+  var batchEnd = index;
+  while (index < total && scanned < MAX_SCAN && found.length < args.limit && Date.now() < deadline) {
+    if (index === batchEnd) {
+      batchStart = index;
+      batchEnd = Math.min(index + HEADER_BATCH_SIZE, total, index + MAX_SCAN - scanned);
+      batch = headerBatch(box, batchStart, batchEnd);
+    }
+    var position = index - batchStart;
     var message = box.messages[index];
     index += 1;
     scanned += 1;
-    var match = message.subject().toLowerCase().indexOf(query) !== -1 ||
-      message.sender().toLowerCase().indexOf(query) !== -1;
+    var match = batch.subjects[position].toLowerCase().indexOf(query) !== -1 ||
+      batch.senders[position].toLowerCase().indexOf(query) !== -1;
     if (!match && args.search_body) {
       checkBodySize(message);
       match = message.content().toLowerCase().indexOf(query) !== -1;
     }
-    if (match) found = found.concat([summary(message, args)]);
+    if (match) {
+      var item = summary(message, args);
+      requireValue(item.subject === batch.subjects[position] && item.sender === batch.senders[position],
+        'Mailbox changed while searching; list messages again');
+      found = found.concat([item]);
+    }
   }
+  requireValue(scanned > 0 || index >= total, 'Mail took too long to resolve the mailbox; try again later');
   return { messages: found, next_offset: index < total ? index : null, complete: index >= total, scanned: scanned };
 }
 

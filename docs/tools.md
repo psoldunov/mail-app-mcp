@@ -64,7 +64,13 @@ Returns `{"mailboxes": [...]}` with `account_id`, `path`, and `unread_count` for
 
 Returns `messages`, `next_offset`, `complete`, and `scanned`. Each message contains `ref`, `subject`, `sender`, `date_received` (ISO timestamp), `read`, and `flagged`.
 
+The returned `ref.mailbox` is the message's owning mailbox in Mail. It can differ from the searched mailbox: Gmail may list a message in `INBOX` while reporting its owner as `["[Gmail]", "All Mail"]`. Use the returned reference unchanged for subsequent operations.
+
 Search applies to one mailbox and scans at most 200 messages per call. With a query, a page can have no matches and still have a non-null `next_offset`. Continue using that offset with the same account, mailbox, and query until `complete` is true and `next_offset` is null. There is no regex, provider search syntax, or arbitrary predicate. Ordering follows Mail; offset pagination is best effort while Mail changes and may skip or repeat entries.
+
+Headers are fetched in batches of 10. A page stops starting new message checks after a 10-second work budget, so it may return fewer than `limit` matches or scan fewer than 200 messages. An in-progress Mail event can exceed that budget; the bridge still enforces its 30-second timeout. If cached headers no longer match a selected message, the search fails with `Mailbox changed while searching`.
+
+If mailbox lookup consumes the budget before any message is scanned, the search returns an explicit timeout message instead of a continuation offset that cannot advance.
 
 Before loading a body for `search_body: true`, the bridge requires Mail's reported message size to be known, positive, and no more than 20 MiB. Encountering an oversized or unknown-size message that needs body searching fails that call. Use `search_body: false` to search only subject/sender without loading bodies.
 

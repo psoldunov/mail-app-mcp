@@ -4,6 +4,8 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
 const { dispatch } = require('../src/mail_app_mcp/mail.js');
+global.Automation = { getDisplayString: (value) => value.specifier };
+let nextSpecifier = 0;
 
 function collection(items) {
   const value = () => items.slice();
@@ -11,13 +13,16 @@ function collection(items) {
   items.forEach((item, index) => { value[index] = item; });
   value.whose = (criteria) => () => items.filter((item) =>
     Object.keys(criteria).every((key) => item[key]() === criteria[key]));
+  value.slice = (start, end) => collection(items.slice(start, end + 1));
+  value.subject = () => items.map((item) => item.subject());
+  value.sender = () => items.map((item) => item.sender());
   value.push = (item) => { items.push(item); };
   return value;
 }
 
 function scripting(initial) {
   let state = initial;
-  return Object.defineProperties({}, Object.fromEntries(Object.keys(initial).map((key) => [key, {
+  return Object.defineProperties({ specifier: `object:${nextSpecifier++}`, exists: () => true }, Object.fromEntries(Object.keys(initial).map((key) => [key, {
       get: () => () => state[key], set: (value) => { state = { ...state, [key]: value }; },
     }])));
 }
@@ -63,11 +68,52 @@ test('lists public account fields plus the local account', () => {
   ] });
 });
 
+test('lists and searches flat mailboxes with an account as their terminal container', () => {
+  const { mail, account, inbox } = fixture();
+  const terminal = { specifier: account.specifier,
+    container: () => assert.fail('Account is not a mailbox') };
+  const group = scripting({ name: '[Gmail]', account, container: terminal });
+  inbox.container = group;
+  account.mailboxes = collection([inbox]);
+  assert.deepEqual(dispatch(mail, 'list_mailboxes', { account_id: 'a1' }),
+    { mailboxes: [{ account_id: 'a1', path: ['[Gmail]', 'Inbox'], unread_count: 1 }] });
+  const result = dispatch(mail, 'list_messages', { account_id: 'a1', mailbox: ['[Gmail]', 'Inbox'],
+    offset: 0, limit: 20, query: 'hello', search_body: false });
+  assert.equal(result.messages.length, 1);
+  assert.deepEqual(result.messages[0].ref.mailbox, ['[Gmail]', 'Inbox']);
+});
+
+test('local mailbox paths end at a nonexistent account without hiding automation failures', () => {
+  const { mail } = fixture();
+  const terminal = { exists: () => false, name: () => assert.fail('Missing local account was read') };
+  const parent = scripting({ name: 'Local', account: null, container: terminal });
+  const child = scripting({ name: 'Archive', account: null, container: parent, unreadCount: 0 });
+  mail.mailboxes = collection([child]);
+  assert.deepEqual(dispatch(mail, 'list_mailboxes', { account_id: '__local__' }),
+    { mailboxes: [{ account_id: '__local__', path: ['Local', 'Archive'], unread_count: 0 }] });
+  parent.container = { exists: () => { throw new Error('Automation denied'); } };
+  assert.throws(() => dispatch(mail, 'list_mailboxes', { account_id: '__local__' }), /Automation denied/);
+});
+
+test('search references use the owning mailbox and reject a different account', () => {
+  const { mail, archive, messages } = fixture();
+  messages[0].mailbox = archive;
+  archive.messages = collection(messages);
+  const args = { account_id: 'a1', mailbox: ['Inbox'], offset: 0, limit: 20,
+    query: 'hello', search_body: false };
+  const result = dispatch(mail, 'list_messages', args);
+  assert.deepEqual(result.messages[0].ref.mailbox, ['Archive']);
+  assert.equal(dispatch(mail, 'read_message', { ref: result.messages[0].ref, max_chars: 4 }).body, 'Body');
+  archive.account = scripting({ id: 'other-account' });
+  assert.throws(() => dispatch(mail, 'list_messages', args), /account.*changed/);
+});
+
 test('lists exact mailbox segment paths, including slashes, and rejects ambiguity', () => {
   const { mail, account, inbox } = fixture();
   const child = Object.assign(scripting({ name: 'A/B', account, container: inbox, unreadCount: 2 }),
     { mailboxes: collection([]), messages: collection([]) });
   inbox.mailboxes = collection([child]);
+  account.mailboxes = collection([inbox, child]);
   const result = dispatch(mail, 'list_mailboxes', { account_id: 'a1' });
   assert.deepEqual(result.mailboxes[1], { account_id: 'a1', path: ['Inbox', 'A/B'], unread_count: 2 });
   account.mailboxes = collection([inbox, inbox]);
@@ -86,6 +132,78 @@ test('search scans at most 200 messages and resumes even when first page has no 
   assert.equal(next.complete, true);
   assert.equal(next.next_offset, null);
   assert.equal(next.scanned, 1);
+});
+
+test('header search batches only its bounded scan window', () => {
+  const { mail, inbox, messages } = fixture(201);
+  inbox.messages = collection(messages.map((message) => new Proxy(message, { get(target, key) {
+    if (['subject', 'sender', 'content'].includes(key)) assert.fail('Individual header or body was fetched');
+    return target[key];
+  } })));
+  const ranges = [];
+  inbox.messages.slice = (start, end) => {
+    ranges.push([start, end]);
+    return { subject: () => Array(10).fill('Other'), sender: () => Array(10).fill('other@example.com') };
+  };
+  assert.deepEqual(dispatch(mail, 'list_messages', { account_id: 'a1', mailbox: ['Inbox'],
+    offset: 0, limit: 20, query: 'needle', search_body: false }),
+  { messages: [], next_offset: 200, complete: false, scanned: 200 });
+  assert.equal(ranges.length, 20);
+  assert.deepEqual(ranges[0], [0, 9]);
+  assert.deepEqual(ranges[19], [190, 199]);
+});
+
+test('search returns a resumable page when Mail exhausts the time budget', (t) => {
+  let now = 0;
+  t.mock.method(Date, 'now', () => now);
+  const { mail, inbox, messages } = fixture(2);
+  inbox.messages.slice = () => ({
+    subject: () => ['Hello [literal]', 'Hello [literal]'],
+    sender: () => { now = 10001; return ['other@example.com', 'other@example.com']; },
+  });
+  const result = dispatch(mail, 'list_messages', { account_id: 'a1', mailbox: ['Inbox'],
+    offset: 0, limit: 20, query: '', search_body: false });
+  assert.equal(result.scanned, 1);
+  assert.equal(result.next_offset, 1);
+  assert.equal(result.complete, false);
+  assert.equal(result.messages[0].ref.message_id, messages[0].id());
+  inbox.messages = collection(messages);
+  const next = dispatch(mail, 'list_messages', { account_id: 'a1', mailbox: ['Inbox'],
+    offset: result.next_offset, limit: 20, query: '', search_body: false });
+  assert.equal(next.messages[0].ref.message_id, messages[1].id());
+  assert.equal(next.complete, true);
+  assert.equal(next.next_offset, null);
+});
+
+test('search handles exhausted pages and rejects incomplete header batches', () => {
+  const { mail, inbox } = fixture();
+  inbox.messages.slice = () => assert.fail('Read beyond the last message');
+  const args = { account_id: 'a1', mailbox: ['Inbox'], offset: 1, limit: 20, query: '', search_body: false };
+  assert.deepEqual(dispatch(mail, 'list_messages', args),
+    { messages: [], next_offset: null, complete: true, scanned: 0 });
+  inbox.messages.slice = () => ({ subject: () => [], sender: () => ['other@example.com'] });
+  assert.throws(() => dispatch(mail, 'list_messages', { ...args, offset: 0 }), /Mailbox changed/);
+});
+
+test('slow mailbox lookup fails instead of returning a nonadvancing continuation', (t) => {
+  let now = 0;
+  t.mock.method(Date, 'now', () => now);
+  const { mail, account } = fixture();
+  const boxes = account.mailboxes();
+  account.mailboxes = () => { now += 10001; return boxes; };
+  assert.throws(() => dispatch(mail, 'list_messages', { account_id: 'a1', mailbox: ['Inbox'],
+    offset: 0, limit: 20, query: '', search_body: false }), /too long/);
+});
+
+test('search rejects reordered messages rather than returning a nonmatching result', () => {
+  const { mail, inbox, messages } = fixture(2);
+  messages[1].subject = 'Unrelated';
+  inbox.messages.slice = () => ({ subject: () => ['Needle', 'Unrelated'], sender: () => {
+    inbox.messages[0] = messages[1];
+    return ['other@example.com', 'other@example.com'];
+  } });
+  assert.throws(() => dispatch(mail, 'list_messages', { account_id: 'a1', mailbox: ['Inbox'],
+    offset: 0, limit: 20, query: 'needle', search_body: false }), /Mailbox changed/);
 });
 
 test('reads bounded body only after exact reference validation', () => {
@@ -330,6 +448,7 @@ test('special descendants and known sending names cannot be move destinations', 
   const child = Object.assign(scripting({ name: 'Queue', account, container: outbox, unreadCount: 0 }),
     { mailboxes: collection([]) });
   outbox.mailboxes = collection([child]);
+  account.mailboxes = collection(account.mailboxes().concat([child]));
   assert.throws(() => dispatch(mail, 'move_message', { ref, destination: ['Localized outgoing', 'Queue'] }), /Unsafe/);
   const later = Object.assign(scripting({ name: 'Send Later', account, container: null, unreadCount: 0 }),
     { mailboxes: collection([]) });
