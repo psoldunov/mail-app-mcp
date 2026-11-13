@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: cachix/install-nix-action@d698718aa798980d17dd749f03beae0b51183399 # v31
+        with:
+          extra_nix_config: |
+            accept-flake-config = false
+      - name: Python coverage, Node bridge, and Home Manager checks
+        run: nix flake check --print-build-logs
+      - name: Compile JXA without opening Mail
+        run: |
+          mkdir -p .context
+          /usr/bin/osacompile -l JavaScript -o .context/mail.scpt src/mail_app_mcp/mail.js
