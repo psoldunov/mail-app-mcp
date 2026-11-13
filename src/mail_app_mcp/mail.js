@@ -13,7 +13,8 @@ var SEARCH_BUDGET_MS = 10000;
 // 5-15 s later in live runs.
 var SAVED_DRAFT_WAIT_MS = 30000;
 var MAX_SEARCH_MATCHES = 20000;
-var GLOBAL_SEARCH_BUDGET_MS = 20000;
+// A cold first search over ~40 Gmail mailboxes took 20 s; warm ones take ~4 s. The bridge stops at 45 s.
+var GLOBAL_SEARCH_BUDGET_MS = 35000;
 
 function requireValue(condition, message) {
   if (!condition) {
