@@ -57,7 +57,7 @@ For a behavior change, test the public tool or external boundary that demonstrat
 
 ## Manual acceptance with a disposable account
 
-This checklist is opt-in and is not part of automated tests. Do it only when an operator is present and explicitly chooses to test live Mail. The list, read, draft, reply, and show paths of this version were checked against Mail 16 on macOS 27.2 with a Gmail account; moves and Trash were not. Use disposable accounts and messages, with no queued or scheduled mail. Mail may connect to providers and sync changes during this procedure.
+This checklist is opt-in and is not part of automated tests. Do it only when an operator is present and explicitly chooses to test live Mail. The list, read, draft, reply, and show paths were checked against Mail 16 on macOS 27.2 with a Gmail account. Later field testing on Mail 16/macOS 27.0.1 found native move timeouts and a message removed from INBOX without reaching the requested Gmail label. Trash transfers in the earlier build completed but returned `-1728`. The restored mailbox assignment with fresh verification needs a new live test for both filing and Trash. Use disposable accounts and messages, with no queued or scheduled mail. Mail may connect to providers and sync changes during this procedure.
 
 Record the macOS version, Mail version, account backend, server commit, client launcher, and result for each check. Do not publish real addresses, message contents, or attachment data in test logs.
 
