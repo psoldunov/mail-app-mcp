@@ -16,12 +16,12 @@ def test_real_stdio_rejects_forbidden_operations_and_keeps_serving(tmp_path):
             async with ClientSession(read, write) as client:
                 await client.initialize()
                 tools = await client.list_tools()
-                assert len(tools.tools) == 12
+                assert len(tools.tools) == 13
                 refused = await client.call_tool("send", {})
                 assert refused.isError
                 invalid = await client.call_tool("read_message", {"ref": {"message_id": 1}})
                 assert invalid.isError
-                assert len((await client.list_tools()).tools) == 12
+                assert len((await client.list_tools()).tools) == 13
 
     asyncio.run(scenario())
     assert not (tmp_path / "Library").exists()

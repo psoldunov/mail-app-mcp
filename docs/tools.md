@@ -1,6 +1,6 @@
 # Tool reference
 
-The server exposes twelve tools over local MCP stdio. The JSON examples are tool argument objects, not shell commands. Replace example IDs, paths, and addresses with values returned by discovery. All Mail calls require Mail to be running already. If Mail is closed, a call returns a tool error without closing the MCP connection or starting a retry loop.
+The server exposes thirteen tools over local MCP stdio. The JSON examples are tool argument objects, not shell commands. Replace example IDs, paths, and addresses with values returned by discovery. A Mail tool call launches Mail hidden if it is closed. Existing Mail windows keep their visibility. Startup errors leave the MCP connection open.
 
 Successful tools return JSON objects through the MCP SDK. Validation, policy, and Mail failures are reported as tool errors, not successful empty results. MCP tool annotations describe intent; they do not grant permission or prevent Mail from synchronizing.
 
@@ -8,7 +8,7 @@ Successful tools return JSON objects through the MCP SDK. Validation, policy, an
 
 An account ID is an opaque, nonempty string, up to 512 characters without control characters U+0000 through U+001F. `__local__` represents On My Mac. A mailbox path is an array of 1 to 20 exact name segments, each 1 to 255 characters with the same control-character restriction. A slash inside a segment is part of the name.
 
-Copy the complete `ref` returned by `list_messages` when addressing a message:
+Copy the complete `ref` returned by `list_messages` or `search_messages` when addressing a message:
 
 ```json
 {
@@ -74,6 +74,30 @@ If mailbox lookup consumes the budget before any message is scanned, the search 
 
 Before loading a body for `search_body: true`, the bridge requires Mail's reported message size to be known, positive, and no more than 20 MiB. Encountering an oversized or unknown-size message that needs body searching fails that call. Use `search_body: false` to search only subject/sender without loading bodies.
 
+## search_messages
+
+```json
+{"from": "isabel", "sort": "newest", "limit": 1}
+```
+
+Searches all accounts and mailboxes visible to Mail, including On My Mac, Sent, Junk, and Trash. Mail evaluates the literal sender substring in `from`; this is not an IMAP/provider search. No bodies are fetched. An empty `from` matches all messages. Use the existing `list_messages` tool for subject/body searches.
+
+| Argument | Default | Meaning |
+| --- | --- | --- |
+| `from` | `""` | Literal sender substring, up to 1,000 characters, using Mail's matching semantics. |
+| `sort` | `"newest"` | `newest` or `oldest`, by received date. |
+| `limit` | `50` | Maximum messages returned, from 1 to 100. |
+| `account_id` | `null` | Restrict to one account, including `__local__`. |
+| `mailbox` | `null` | Exact mailbox path; requires `account_id`. |
+
+All matching IDs and received dates are considered before applying `limit`. Repeated label views of the same account and Mail ID are deduplicated. Equal timestamps are ordered by account ID and numeric Mail ID. Returned message fields and owning-mailbox references match `list_messages`.
+
+`complete: true` means the selected scope was fully enumerated during the call; `has_more: true` means the limit omitted additional matches. Unlike `list_messages`, this tool does not return a partial scan or continuation. It fails if a mailbox fails, metadata changes are detected, or the search exceeds 1,000 mailboxes, 20,000 matching header occurrences, or a 20-second work budget. Narrow the scope or sender filter and retry. One Apple event can exceed the work budget; the bridge's 30-second timeout remains the outer limit.
+
+Mail does not provide an atomic snapshot through scripting. New mail can arrive during a call, and results reflect Mail's currently available data, not a freshly synchronized provider snapshot. Matching and bulk-property behavior still require live acceptance on the installed Mail version.
+
+`matched_candidates` counts header occurrences before deduplication; `mailboxes_searched` counts the selected mailboxes. `timing_ms` reports discovery, filter-and-sort, summary, and total work as `discovery`, `filter_and_sort`, `summaries`, and `total`. These timings exclude process startup and hidden application launch, so compare them with the client's total duration when profiling.
+
 ## read_message
 
 | Argument | Default | Meaning |
@@ -106,7 +130,7 @@ The server chooses a private temporary path and removes the export after process
 
 ## create_draft
 
-Arguments are `draft` (required) and `open_window` (boolean, default `false`). `open_window: true` requests that the saved draft be shown in already-running Mail. The `draft` object contains these fields:
+Arguments are `draft` (required) and `open_window` (boolean, default `false`). `open_window: true` requests that the saved draft be shown in Mail. The `draft` object contains these fields:
 
 | Field | Default | Meaning |
 | --- | --- | --- |
@@ -142,7 +166,7 @@ Returns `draft_id`, `account_id`, `sender`, and `status: "draft"`. The sender mu
 | `sender` | Required | Exact advertised address of the source account. |
 | `body` | Required | Plain text up to 100,000 characters. |
 | `reply_all` | `false` | Use Mail's native reply-all recipients when true. |
-| `open_window` | `false` | Show the saved reply draft in already-running Mail. |
+| `open_window` | `false` | Show the saved reply draft in Mail. |
 
 ```json
 {
@@ -164,7 +188,7 @@ The source message must have a known, positive Mail-reported size no greater tha
 
 ## show_message
 
-One required argument: `ref`, the complete message reference. Opens that revalidated message in already-running Mail and may bring Mail forward. It does not accept paths or URLs and never launches Mail. Showing a message may affect its read state through Mail's normal behavior.
+One required argument: `ref`, the complete message reference. Opens that revalidated message in Mail and may bring Mail forward. It does not accept paths or URLs. Showing a message may affect its read state through Mail's normal behavior.
 
 Returns `{"shown": true}`. Like other operations with side effects, this tool observes the shared write lock and uncertain-write block.
 
@@ -176,7 +200,7 @@ Returns `{"shown": true}`. Like other operations with side effects, this tool ob
 | `draft_id` | Yes | Positive integer ID up to 2⁵³ − 1 returned by `create_draft` or `reply_draft`. |
 | `sender` | Yes | Exact sender returned by draft creation. |
 
-Shows the identified outgoing draft in already-running Mail and may bring Mail forward. The account and sender must still validate. A draft ID only refers to a currently available outgoing draft; it can become stale after a window closes or Mail restarts. Failure to find it is an ordinary tool error. Locate the draft manually in Mail instead of creating a duplicate. This tool cannot edit or send the draft, open an arbitrary file, or follow a URL.
+Shows the identified outgoing draft in Mail and may bring Mail forward. The account and sender must still validate. A draft ID only refers to a currently available outgoing draft; it can become stale after a window closes or Mail restarts. Failure to find it is an ordinary tool error. Locate the draft manually in Mail instead of creating a duplicate. This tool cannot edit or send the draft, open an arbitrary file, or follow a URL.
 
 Returns `shown: true`, `draft_id`, and `account_id`. It observes the shared write lock and uncertain-write block.
 
@@ -209,6 +233,8 @@ Moves the message to that account's explicitly configured `trash_mailbox`. Missi
 
 ## Errors and recovery
 
+Automation errors include the failed operation, bounded underlying automation message or stderr, an AppleScript error number when provided, and `retry_safe=true|false`. Read timeouts and invalid responses are safe to retry and do not claim an unknown write outcome. Retrying safely does not fix denied permissions or unavailable accounts.
+
 The bridge gives Mail operations 30 seconds. A timeout or failed response after a write can mean Mail accepted the operation but the result was lost. A persistent `write-uncertain` marker blocks later writes until the owner reconciles Mail and clears it manually. Do not automatically retry writes. Reads remain available. See [setup and recovery](setup.md#recover-after-an-uncertain-write).
 
-There are no send, permanent-delete, empty-Trash, arbitrary-script, rules, account-settings, launch, quit, or runtime-policy tools. [The safety model](safety.md) describes the boundary with other agent tools and Mail itself.
+There are no send, permanent-delete, empty-Trash, arbitrary-script, rules, account-settings, quit, or runtime-policy tools. [The safety model](safety.md) describes the boundary with other agent tools and Mail itself.

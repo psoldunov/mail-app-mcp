@@ -4,7 +4,7 @@
 
 The server calls a packaged, fixed JXA program through `/usr/bin/osascript`. Requests are JSON data. Neither MCP callers nor mailbox content can supply executable scripts, arbitrary property names, shell commands, provider URLs, or local file paths.
 
-All mail access goes through the already-running Mail application. Explicit show tools and `open_window: true` on draft creation may bring that application forward and open the identified item. They accept no arbitrary open path or URL. The server does not read private Mail databases, manage credentials, or use IMAP, SMTP, or provider APIs. It exposes local stdio only, with no HTTP listener. Mail may synchronize reads, drafts, flags, and moves with its providers over the network.
+All mail access goes through Mail. A tool call launches Mail hidden when it is closed, without activating or hiding an existing session. Launching can trigger Mail synchronization, rules, and queued mail. Explicit show tools and `open_window: true` on draft creation may bring that application forward and open the identified item. They accept no arbitrary open path or URL. The server does not read private Mail databases, manage credentials, or use IMAP, SMTP, or provider APIs. It exposes local stdio only, with no HTTP listener. Mail may synchronize reads, drafts, flags, and moves with its providers over the network.
 
 All Mail accounts are discoverable and readable. Move allowlists do not restrict reading, attachment extraction, draft creation, or status changes. The MCP client and its operator decide who may invoke these tools. Returned message and attachment content enters the MCP client and may be passed to its model provider according to that client's settings.
 
@@ -32,7 +32,7 @@ Treat message bodies, filenames, PDF text, and attachment content as data. A mes
 
 ## Limits of the guarantee
 
-There are no tools for sending, permanent deletion, rules, account settings, arbitrary AppleScript/JXA, launching Mail, or quitting Mail. The fixed dispatch table also excludes those operations. Mail itself can still process queued mail, apply rules, synchronize changes, and expire messages while running.
+There are no tools for sending, permanent deletion, rules, account settings, arbitrary AppleScript/JXA, or quitting Mail. Hidden launch is part of the fixed startup path, not a caller-configurable tool. The fixed dispatch table also excludes those operations. Mail itself can still process queued mail, apply rules, synchronize changes, and expire messages while running.
 
 An agent with another shell or automation tool can bypass this server and call Mail directly. Restrict those tools separately if you rely on the no-send boundary. The server is not an operating-system sandbox.
 

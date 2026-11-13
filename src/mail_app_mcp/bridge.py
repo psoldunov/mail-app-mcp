@@ -12,64 +12,102 @@ from contextlib import contextmanager
 
 from .process import ProcessCommunicationError, run_bounded
 
-OPERATIONS = frozenset({
+READ_OPERATIONS = frozenset({
     "list_accounts", "list_mailboxes", "list_messages", "read_message",
-    "save_attachment", "create_draft", "reply_draft", "set_message_status", "move_message",
+    "search_messages", "save_attachment",
+})
+OPERATIONS = READ_OPERATIONS | frozenset({
+    "create_draft", "reply_draft", "set_message_status", "move_message",
     "show_message", "show_draft",
 })
 MAX_RESPONSE = 2_000_000
 TIMEOUT_SECONDS = 30
+MAX_ERROR_DETAIL = 1000
 
 
 class BridgeError(RuntimeError):
     """An operation failed without returning a trustworthy result."""
+
+    def __init__(self, message: str, *, operation: str | None = None,
+                 apple_script_error_number: int | float | None = None):
+        self.operation = operation
+        self.retry_safe = operation in READ_OPERATIONS
+        self.apple_script_error_number = apple_script_error_number
+        if apple_script_error_number is not None:
+            message += f" (apple_script_error_number={apple_script_error_number})"
+        if operation is not None:
+            message = f"{operation}: {message} (retry_safe={str(self.retry_safe).lower()})"
+        super().__init__(message)
 
 
 class OutcomeUnknown(BridgeError):
     """Mail might have accepted an operation before the transport failed."""
 
 
+def uncertain_error(message: str, operation: str | None,
+                    apple_script_error_number: int | float | None = None) -> BridgeError:
+    error_type = BridgeError if operation in READ_OPERATIONS else OutcomeUnknown
+    if error_type is OutcomeUnknown:
+        message += ". The write outcome is unknown. Do not retry a write before inspecting Mail."
+    return error_type(message, operation=operation, apple_script_error_number=apple_script_error_number)
+
+
 class MailBridge:
     def call(self, operation: str, arguments: dict) -> dict:
         if operation not in OPERATIONS:
-            raise BridgeError("Unsupported Mail operation")
+            raise BridgeError("Unsupported Mail operation", operation=operation)
         if sys.platform != "darwin":
-            raise BridgeError("Mail automation requires macOS")
+            raise BridgeError("Mail automation requires macOS", operation=operation)
         request = json.dumps({"operation": operation, "args": arguments}, ensure_ascii=True)
         if len(request) > MAX_RESPONSE:
-            raise BridgeError("Mail request exceeds the size limit")
+            raise BridgeError("Mail request exceeds the size limit", operation=operation)
         try:
             result = run_bounded(
                 ["/usr/bin/osascript", "-l", "JavaScript", str(Path(__file__).with_name("mail.js"))],
                 request, timeout=TIMEOUT_SECONDS,
             )
         except subprocess.TimeoutExpired as exc:
-            raise OutcomeUnknown("Mail timed out; the outcome may be unknown. Do not retry a write before inspecting Mail.") from exc
+            raise uncertain_error(f"Mail timed out: {error_detail(exc)}", operation) from exc
         except (ProcessCommunicationError, UnicodeError) as exc:
-            raise OutcomeUnknown("Mail returned excessive or invalid output. Inspect Mail before retrying a write.") from exc
+            raise uncertain_error(f"Mail returned excessive or invalid output: {error_detail(exc)}", operation) from exc
         except OSError as exc:
-            raise BridgeError("Cannot start macOS Mail automation") from exc
+            raise BridgeError(f"Cannot start macOS Mail automation: {error_detail(exc)}", operation=operation) from exc
         if result.returncode != 0:
-            raise OutcomeUnknown("Mail automation failed. Check Automation permission and inspect Mail before retrying a write.")
-        return decode_response(result.stdout)
+            detail = result.stderr.strip()[:MAX_ERROR_DETAIL] or "No stderr returned"
+            raise uncertain_error(f"Mail automation failed (exit code {result.returncode}): {detail}", operation)
+        return decode_response(result.stdout, operation=operation)
 
 
-def decode_response(output: str) -> dict:
+def error_detail(error: Exception) -> str:
+    stderr = getattr(error, "stderr", None)
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode("utf-8", errors="replace")
+    parts = (str(error), str(error.__cause__) if error.__cause__ else "", stderr)
+    return "; ".join(part for part in parts if part)[:MAX_ERROR_DETAIL]
+
+
+def decode_response(output: str, *, operation: str | None = None) -> dict:
     if len(output.encode("utf-8")) > MAX_RESPONSE:
-        raise OutcomeUnknown("Mail response exceeded the size limit; write outcome is unknown")
+        raise uncertain_error("Mail response exceeded the size limit", operation)
     try:
         envelope = json.loads(output)
     except (ValueError, TypeError) as exc:
-        raise OutcomeUnknown("Mail returned invalid JSON; write outcome is unknown") from exc
+        raise uncertain_error(f"Mail returned invalid JSON: {exc}", operation) from exc
     if not isinstance(envelope, dict) or type(envelope.get("ok")) is not bool:
-        raise OutcomeUnknown("Mail returned an invalid response")
+        raise uncertain_error("Mail returned an invalid response", operation)
     if not envelope["ok"]:
         error = envelope.get("error")
+        number = envelope.get("apple_script_error_number")
+        if type(number) not in (int, float):
+            number = None
         if isinstance(error, str) and error.startswith("Outcome unknown:"):
-            raise OutcomeUnknown(error[:1000])
-        raise BridgeError(error[:1000] if isinstance(error, str) else "Mail operation failed")
+            if operation in READ_OPERATIONS:
+                error = error.removeprefix("Outcome unknown:").strip()
+            raise uncertain_error(error[:MAX_ERROR_DETAIL], operation, number)
+        raise BridgeError(error[:MAX_ERROR_DETAIL] if isinstance(error, str) else "Mail operation failed",
+                          operation=operation, apple_script_error_number=number)
     if not isinstance(envelope.get("result"), dict):
-        raise OutcomeUnknown("Mail returned an invalid result")
+        raise uncertain_error("Mail returned an invalid result", operation)
     return envelope["result"]
 
 

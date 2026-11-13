@@ -13,6 +13,10 @@ CHUNK = 65_536
 class ProcessCommunicationError(RuntimeError):
     """The child started, but its response could not be safely collected."""
 
+    def __init__(self, message: str, *, stderr: bytes = b""):
+        super().__init__(message)
+        self.stderr = stderr[:MAX_STDERR]
+
 
 class OutputLimitExceeded(ProcessCommunicationError):
     """The child exceeded its output budget and was terminated."""
@@ -34,7 +38,7 @@ def run_bounded(command: list[str], request: str, timeout: float) -> subprocess.
 def _collect(process, command, request: bytes, timeout: float):
     deadline = time.monotonic() + timeout
     stdout = b""
-    stderr_size = 0
+    stderr = b""
     position = 0
     with selectors.DefaultSelector() as selector:
         for stream, events, name in ((process.stdin, selectors.EVENT_WRITE, "stdin"),
@@ -45,7 +49,7 @@ def _collect(process, command, request: bytes, timeout: float):
         while selector.get_map():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise subprocess.TimeoutExpired(command, timeout)
+                raise subprocess.TimeoutExpired(command, timeout, stderr=stderr)
             for key, _ in selector.select(remaining):
                 stream = key.fileobj
                 if key.data == "stdin":
@@ -64,9 +68,16 @@ def _collect(process, command, request: bytes, timeout: float):
                 elif key.data == "stdout":
                     stdout += chunk
                 else:
-                    stderr_size += len(chunk)
-                if len(stdout) > MAX_STDOUT or stderr_size > MAX_STDERR:
-                    raise OutputLimitExceeded("Mail automation exceeded the output budget")
+                    stderr += chunk
+                if len(stdout) > MAX_STDOUT or len(stderr) > MAX_STDERR:
+                    raise OutputLimitExceeded("Mail automation exceeded the output budget", stderr=stderr)
     remaining = max(0, deadline - time.monotonic())
-    returncode = process.wait(timeout=remaining)
-    return subprocess.CompletedProcess(command, returncode, stdout.decode("utf-8"), "")
+    try:
+        returncode = process.wait(timeout=remaining)
+    except subprocess.TimeoutExpired as exc:
+        raise subprocess.TimeoutExpired(command, timeout, stderr=stderr) from exc
+    try:
+        output = stdout.decode("utf-8")
+    except UnicodeError as exc:
+        raise ProcessCommunicationError(f"Mail returned invalid UTF-8: {exc}", stderr=stderr) from exc
+    return subprocess.CompletedProcess(command, returncode, output, stderr.decode("utf-8", errors="replace"))
