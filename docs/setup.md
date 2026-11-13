@@ -128,8 +128,9 @@ Use actual absolute paths; do not rely on shell expansion of `~`. Starting the e
 | Automation permission denied | Check the responsible launcher under macOS Automation settings. Inspect Mail before repeating any attempted write. |
 | `programs.mcp` option is missing | Use a Home Manager revision that provides it, such as the pinned revision in the README. |
 | Server is missing in the client | Check that the client consumes Home Manager's configuration or copy the generated command/args into its own settings. |
-| Destination or Trash is not configured | Rediscover that account's mailbox paths, update its policy, then restart the server. |
-| Missing, stale, or ambiguous reference | List the source mailbox again and use the newly returned `ref`. Moves and external changes can invalidate IDs. |
+| Destination or Trash is not configured | Denied moves list that account's configured destinations. Rediscover mailbox paths, update the owner-controlled policy, then restart the server. Sending mailbox restrictions still apply. |
+| Missing, stale, or ambiguous reference | List the source mailbox again and use the newly returned `ref`. Draft autosave can change both IDs; moves and external changes can also invalidate references. |
+| Cannot reply to a saved draft | Select a received message, or use `create_draft` for a new standalone draft. Saved drafts cannot be reply sources. |
 | Outgoing draft is no longer available | A `draft_id` can become stale after its window closes or Mail restarts. Locate it manually in Mail; do not create another draft just to show it. |
 | Message size is unknown or exceeds 20 MiB | Use subject/sender search with `search_body: false`, or read/reply manually in Mail. Reducing `max_chars` does not bypass the source-size guard. |
 | Attachment is not downloaded | Download it in Mail manually before calling `read_attachment`. |

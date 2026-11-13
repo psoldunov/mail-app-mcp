@@ -23,6 +23,8 @@ Copy the complete `ref` returned by `list_messages` or `search_messages` when ad
 
 Message references and draft objects reject unknown fields. Booleans such as `read`, `flagged`, and `reply_all` must be JSON booleans, not strings or numbers. Numeric limits and offsets require JSON integers.
 
+Draft autosave can change both `message_id` and `header_message_id`, even immediately after a listing. If a reference is missing or stale, call `list_messages` again and use the fresh `ref`. An outgoing `draft_id` is a separate identifier used only by `show_draft`; never substitute it into a message reference.
+
 ## list_accounts
 
 Arguments: `{}`.
@@ -189,6 +191,8 @@ Returns `draft_id`, `account_id`, `sender`, and `status: "draft"`. The sender mu
 Returns the same draft result fields as `create_draft`. Mail supplies native recipients, quoting, and threading. The supplied body is prepended to Mail's reply content. Inspect the draft in Mail before sending it yourself. There is no cross-account reply sender or recipient override, and no existing-draft editing.
 
 The source message must have a known, positive Mail-reported size no greater than 20 MiB before Mail's reply content is loaded.
+
+Saved drafts are rejected before native reply creation, including drafts exposed through Gmail's All Mail view. Choose a received message to reply to, or use `create_draft` for a new standalone draft. This guard checks Mail's native Drafts membership rather than a localized folder name.
 
 ## show_message
 

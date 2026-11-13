@@ -134,7 +134,7 @@ def create_server(settings: Settings | None = None, bridge=None, state_dir: Path
     @tool(DRAFT)
     def reply_draft(ref: MessageRef, sender: Address, body: Body, reply_all: StrictBool = False,
                     open_window: StrictBool = False) -> dict:
-        """Save a reply draft using the source account and explicit sender. Cannot send. Native Mail quoting/threading applies."""
+        """Save a native reply using the source account and explicit sender. Saved draft sources are rejected; select a received message. Cannot send."""
         selected_sender(mail, ref.account_id, sender)
         return perform_write(mail, directory, "reply_draft", {
             "ref": ref.model_dump(mode="json"), "sender": sender, "body": body,

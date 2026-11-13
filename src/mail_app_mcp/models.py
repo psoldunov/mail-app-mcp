@@ -1,5 +1,6 @@
 """Validated MCP inputs and owner-controlled mailbox policy."""
 
+import json
 import re
 from collections.abc import Mapping
 from types import MappingProxyType
@@ -66,7 +67,14 @@ class Settings(Input):
         if any(re.sub(r"\s+", " ", part.strip().casefold()) in FORBIDDEN_FOLDERS for part in target):
             raise ValueError("Sending mailboxes cannot be move destinations")
         if policy is None or target not in (*policy.allowed_destinations, policy.trash_mailbox):
-            raise ValueError("Destination is not configured for this account")
+            configured = () if policy is None else tuple(
+                path for path in (*policy.allowed_destinations, policy.trash_mailbox) if path is not None
+            )
+            raise ValueError(
+                "Destination is not configured for this account. "
+                f"Configured destinations: {json.dumps(configured, ensure_ascii=False)}. "
+                "To change these, update the owner-controlled policy and restart the server"
+            )
         return list(target)
 
     def trash(self, account_id: str) -> list[str]:

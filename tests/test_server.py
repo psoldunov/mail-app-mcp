@@ -159,6 +159,23 @@ def test_move_needs_allowlist_and_rejects_noop(tmp_path):
         call(server, "set_message_status", {"ref": REF})
 
 
+def test_denied_move_explains_allowed_paths_without_attempting_a_write(tmp_path):
+    mail = FixtureMail()
+    settings = Settings.model_validate({"accounts": {"work": {
+        "allowed_destinations": [["Projects", "2026"]], "trash_mailbox": ["Deleted Messages"],
+    }}})
+    server = create_server(settings, mail, tmp_path)
+    with pytest.raises(Exception) as denied:
+        call(server, "move_message", {"ref": REF, "destination": ["Inbox"]})
+    assert '["Projects", "2026"]' in str(denied.value)
+    assert '["Deleted Messages"]' in str(denied.value)
+    assert "restart" in str(denied.value)
+    with pytest.raises(Exception, match=r"Configured destinations: \[\]"):
+        call(server, "move_message", {"ref": {**REF, "account_id": "personal"}, "destination": ["Inbox"]})
+    assert not mail.requests
+    assert not (tmp_path / "write-uncertain").exists()
+
+
 def test_known_rejection_does_not_poison_write_lock(tmp_path):
     class RejectOnce:
         rejected = False
