@@ -66,7 +66,7 @@ Returns `{"mailboxes": [...]}` with `account_id`, `path`, and `unread_count` for
 }
 ```
 
-Returns `messages`, `next_offset`, `complete`, `scanned`, and `stopped`. Each message contains `ref`, `subject`, `sender`, `date_received` (ISO timestamp), `read`, and `flagged`. `ref.mailbox` is the mailbox you listed, so a Gmail `INBOX` listing returns `INBOX` references.
+Returns `messages`, `next_offset`, `complete`, `scanned`, and `stopped`. Each message contains `ref`, `subject`, `sender`, `date_received` (ISO timestamp), `read`, and `flagged`. `ref.mailbox` is the mailbox you listed, so a Gmail `INBOX` listing returns `INBOX` references. Results contain no body preview; use `read_message` for the body of a selected message.
 
 `stopped` says why the page ended: `limit` (enough matches), `time_budget` (body search ran out of time), or `end` (no messages left). Until `complete` is true and `next_offset` is null, continue with `next_offset` and the same account, mailbox, and query. There is no regex, provider search syntax, or arbitrary predicate. Ordering follows Mail; offset pagination is best effort while Mail changes and may skip or repeat entries.
 
@@ -107,7 +107,9 @@ Mail does not provide an atomic snapshot through scripting. New mail can arrive 
 | `ref` | Required | Complete message reference. |
 | `max_chars` | `50000` | Returned body limit, from 1 to 100,000 characters. |
 
-Returns `ref`, `subject`, `sender`, `to`, `cc`, `bcc`, `body`, `truncated`, and `attachments`. Recipient fields are arrays of addresses. Mail leaves the account's own addresses out of its recipient lists, so the server also reads the `To`, `Cc`, and `Bcc` headers and merges them in; `bcc` is usually empty except on drafts. Each attachment has `attachment_id`, `name`, `mime_type`, `size`, and `downloaded`. The size comes from Mail's approximate metadata; attachment extraction checks actual exported bytes too. `truncated: true` means the returned body is incomplete. This limit bounds the returned text, not how much text Mail may load internally.
+Returns `ref`, `subject`, `sender`, `to`, `cc`, `bcc`, `body`, `truncated`, `links`, `links_truncated`, and `attachments`. Recipient fields are arrays of addresses. Mail leaves the account's own addresses out of its recipient lists, so the server also reads the `To`, `Cc`, and `Bcc` headers and merges them in; `bcc` is usually empty except on drafts. Each attachment has `attachment_id`, `name`, `mime_type`, `size`, and `downloaded`. The size comes from Mail's approximate metadata; attachment extraction checks actual exported bytes too. `truncated: true` means the returned body is incomplete. This limit bounds the returned text, not how much text Mail may load internally.
+
+`links` is an array of `{"url": "https://example.org/invoice", "text": "View invoice"}` objects extracted from the message's HTML body. Only `http`, `https`, and `mailto` links are included; the server never fetches or opens them. Extraction considers at most 100,000 characters of MIME source. If the source exceeds that limit, is missing, or its getter reports Mail error `-10000`, the plain-text read remains available with `links: []` and `links_truncated: true`. Other source-getter errors fail the call. The boolean also marks incomplete extraction when link limits are reached. A message without HTML links can return `links: []` with `links_truncated: false`. Raw MIME source is never returned. The source limit is separate from `max_chars` and does not bound how much Mail loads internally.
 
 Mail's attachment MIME-type getter can fail with AppleEvent error `-10000`. The server then guesses the type from the file name and adds a `warning`; when the name gives no type, it reports `application/octet-stream`. The name is untrusted, so a guessed type only decides whether `read_attachment` extracts text. The message body and other metadata remain readable. Other getter errors still fail the call.
 
@@ -164,7 +166,7 @@ Addresses must be 3 to 320 characters, with a local part and domain separated by
 
 Returns `status: "draft"`, `account_id`, `sender`, and `ref`, the reference of the copy Mail saved in Drafts. Pass that `ref` to `read_message` to check the draft or to `show_message` to open it. The sender must belong to exactly one account; an address advertised by multiple accounts is rejected as ambiguous. It saves a new draft and never sends. Mail may sync the draft to its provider, and it can still replace the saved copy later; if the `ref` goes stale, list the Drafts mailbox again. This server cannot edit a draft. A repeated creation call creates another draft; do not retry an uncertain call automatically.
 
-The server composes every draft in a hidden window, saves it, then waits for the saved copy to appear in Drafts with the requested subject and body. It then saves the draft a second time, at least 3 seconds after the first, and returns the newest copy once it has stayed the same for 5 one-second checks. The whole wait stops at 30 seconds. Without the second save, Mail finished the signature after the first one and re-saved the draft about 20 seconds later under new IDs, so the returned `ref` stopped working. If no copy appears in time, the call still succeeds, with `ref: null` and a `warning`; it opens no window, and you should find the draft in Drafts instead of retrying. If a copy appears but never contains the body, the call fails as an uncertain write. If Mail cannot open the saved copy for `open_window`, the call succeeds with the `ref` and a `warning`; open it with `show_message`.
+The server clears Mail's automatic signature for new drafts; include any signature you want in `body`. It composes every draft in a hidden window, saves it, then waits for the saved copy to appear in Drafts with the requested subject and body. It then saves the draft a second time, at least 3 seconds after the first, and returns the newest copy once it has stayed the same for 5 one-second checks. The whole wait stops at 30 seconds. The second save accounts for Mail replacing saved drafts under new IDs during autosave. If no copy appears in time, the call still succeeds, with `ref: null` and a `warning`; it opens no window, and you should find the draft in Drafts instead of retrying. If a copy appears but never contains the body, the call fails as an uncertain write. If Mail cannot open the saved copy for `open_window`, the call succeeds with the `ref` and a `warning`; open it with `show_message`.
 
 Mail keeps every hidden compose window until it quits, and scripting cannot close one. Their drafts are already saved, but Mail can autosave a hidden window into Drafts on its own, so quit Mail now and then to clear them. A compose window that opens visible does close by script and keeps its saved draft, but the server does not compose in one. In testing, reading the body of a visible reply through scripting froze Mail until it was force quit, and a visible reply accepted a scripted body 0.1 seconds after it opened but ignored one set 0.5 seconds or later.
 
@@ -192,7 +194,7 @@ Mail keeps every hidden compose window until it quits, and scripting cannot clos
 }
 ```
 
-Returns the same draft result fields as `create_draft`. Mail supplies the native recipients, subject, and threading headers. The draft's text is your body, then a plain-text quote of the original (`On <date>, <sender> wrote:` followed by `> ` lines, cut at 100,000 characters), then the account signature that Mail adds. Inspect the draft in Mail before sending it yourself. There is no cross-account reply sender or recipient override, and no existing-draft editing.
+Returns the same draft result fields as `create_draft`. Mail supplies the native recipients, subject, and threading headers. The server clears Mail's automatic signature before setting the reply text. The draft contains your body followed by a plain-text quote of the original (`On <date>, <sender> wrote:` followed by `> ` lines, cut at 100,000 characters). Include any signature you want in `body`. Inspect the draft in Mail before sending it yourself. There is no cross-account reply sender or recipient override, and no existing-draft editing.
 
 The server builds the quote itself because of two Mail behaviors. Mail opens a reply window even when asked not to, and a visible reply window autosaves its own quoted text over a scripted body. The server hides the window before setting the body, and a hidden reply keeps the body but drops Mail's quote. Mail first saves a copy with its own quote and replaces it with the body copy 5 to 15 seconds later, so a reply can take that long to return.
 
@@ -214,16 +216,16 @@ Returns `{"shown": true}`. It waits for the shared write lock, but it neither se
 | `read` | `null` | `true` marks read; `false` marks unread; null leaves it unchanged. |
 | `flagged` | `null` | `true` flags; `false` removes the flag; null leaves it unchanged. |
 
-At least one of `read` or `flagged` must be supplied as a boolean. Returns `ref`, `read`, and `flagged` after checking the requested state. This changes no other message properties and requires no move policy.
+At least one of `read` or `flagged` must be supplied as a boolean. Returns `ref`, `read`, and `flagged` after the requested state settles. Verification re-resolves the message every half second and requires three consecutive matching observations, with at most ten polls. If the state does not settle, the call reports an uncertain write and blocks later writes until recovery. This tool changes no other message properties and requires no move policy; Mail or another application can still change the state afterward.
 
 ## move_message
 
 | Argument | Required | Meaning |
 | --- | --- | --- |
 | `ref` | Yes | Complete source message reference. |
-| `destination` | Yes | Exact mailbox path allowed by that account's owner policy. |
+| `destination` | Yes | Exact mailbox path, subject to that account's destination restrictions. |
 
-The destination must already exist in the same account and be an `allowed_destinations` entry or its configured `trash_mailbox`. There is no destination-account argument, folder creation, or cross-account move. Moving to the current mailbox is rejected. Sending destinations and resolved Drafts/Sent destinations are rejected even when configured.
+The destination must already exist in the same account. Without an account policy, or with omitted or `null` `allowed_destinations`, ordinary same-account destinations are permitted. An explicit list, including `[]`, permits only its entries plus an explicit `trash_mailbox` override. There is no destination-account argument, folder creation, or cross-account move. Moving to the current mailbox is rejected. Sending destinations and resolved Drafts/Sent destinations are rejected even when configured.
 
 Returns `account_id`, `destination`, and `moved: true`. It does not return a new reference: list the destination mailbox again before another operation because Mail IDs can change after a move.
 
@@ -231,7 +233,7 @@ Returns `account_id`, `destination`, and `moved: true`. It does not return a new
 
 One required argument: `ref`, the complete message reference.
 
-Moves the message to that account's explicitly configured `trash_mailbox`. Missing configuration and already being in the configured Trash are errors. Returns the same fields as `move_message`. No delete command runs, but Mail or provider retention can permanently purge messages afterward.
+Moves the message to that account's explicit `trash_mailbox` override, or discovers Mail's actual account Trash when the setting is omitted or `null`. Discovery fails if the result is missing or ambiguous; folder names are never guessed. A discovered path must pass `allowed_destinations`, so an explicit restricted list must contain it. An explicit Trash override authorizes its path independently of that list. Sending and Drafts/Sent destination guards still apply. Already being in the selected Trash is an error. Returns the same fields as `move_message`. No delete command runs, but Mail or provider retention can permanently purge messages afterward.
 
 ## Errors and recovery
 

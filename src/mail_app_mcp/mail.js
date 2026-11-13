@@ -1,13 +1,14 @@
 'use strict';
 
-var OPERATIONS = ['list_accounts', 'list_mailboxes', 'list_messages', 'search_messages', 'read_message',
+var OPERATIONS = ['list_accounts', 'list_mailboxes', 'trash_destination', 'list_messages', 'search_messages', 'read_message',
   'save_attachment', 'set_message_status', 'move_message', 'create_draft', 'reply_draft', 'show_message'];
 // Failures of these leave no uncertain mail state; showing a message only opens a window.
-var RETRY_SAFE_OPERATIONS = ['list_accounts', 'list_mailboxes', 'list_messages', 'search_messages', 'read_message',
+var RETRY_SAFE_OPERATIONS = ['list_accounts', 'list_mailboxes', 'trash_destination', 'list_messages', 'search_messages', 'read_message',
   'save_attachment', 'show_message'];
 var MAX_BOXES = 1000;
 var MAX_BODY_BYTES = 20 * 1024 * 1024;
 var MAX_QUOTE_CHARS = 100000;
+var MAX_SOURCE_CHARS = 100000;
 var SEARCH_BUDGET_MS = 10000;
 // A hidden reply's first saved copy is Mail's own quote; the copy with the scripted body replaced it
 // 5-15 s later in live runs.
@@ -16,6 +17,8 @@ var SAVED_DRAFT_WAIT_MS = 30000;
 var SECOND_SAVE_AFTER_MS = 3000;
 var SETTLE_POLLS = 5;
 var MAX_SEARCH_MATCHES = 20000;
+var STATUS_POLLS = 10;
+var STATUS_SETTLE_POLLS = 3;
 // A cold first search over ~40 Gmail mailboxes took 20 s; warm ones take ~4 s. The bridge stops at 60 s.
 var GLOBAL_SEARCH_BUDGET_MS = 35000;
 
@@ -37,7 +40,7 @@ function validPath(path) {
 function validate(operation, args) {
   requireValue(OPERATIONS.indexOf(operation) !== -1, 'Unsupported operation');
   requireValue(args && typeof args === 'object' && !Array.isArray(args), 'Invalid arguments');
-  if (operation === 'list_mailboxes' || operation === 'list_messages' || operation === 'create_draft') {
+  if (['list_mailboxes', 'trash_destination', 'list_messages', 'create_draft'].indexOf(operation) !== -1) {
     requireValue(string(args.account_id), 'Invalid account');
   }
   if (operation === 'list_messages') {
@@ -160,6 +163,29 @@ function listMailboxes(mail, args) {
     return { account_id: args.account_id, path: identity.mailbox, unread_count: box.unreadCount() };
   });
   return { mailboxes: result };
+}
+
+function trashDestination(mail, args) {
+  var boxes = accountBoxes(mail, args.account_id);
+  var paths = [];
+  var visited = 0;
+  function visit(box, depth) {
+    if (!box) return;
+    visited += 1;
+    requireValue(visited <= MAX_BOXES && depth <= 20, 'Trash mailbox hierarchy too large');
+    var account = box.account();
+    // The account-less root is virtual All Trash; only its descendants can identify local Trash.
+    if ((account || depth > 0) && (account ? account.id() : '__local__') === args.account_id) {
+      paths = paths.concat([boxIdentity(box).mailbox]);
+      return; // Ordinary subfolders inside Trash are not alternative Trash destinations.
+    }
+    box.mailboxes().forEach(function (child) { visit(child, depth + 1); });
+  }
+  visit(mail.trashMailbox(), 0);
+  var box = one(boxes.filter(function (candidate) {
+    return paths.some(function (path) { return sameBox(candidate, args.account_id, path); });
+  }), 'Trash mailbox');
+  return { account_id: args.account_id, destination: boxIdentity(box).mailbox };
 }
 
 function summary(message, accountId, mailbox) {
@@ -366,11 +392,19 @@ function readMessage(mail, args) {
   var message = messageFor(mail, args.ref);
   checkBodySize(message);
   var content = message.content();
+  var source;
+  try { source = message.source(); }
+  catch (error) {
+    if (error.errorNumber !== -10000) throw error;
+    // Mail may fail its MIME source getter while plain-text content is still available.
+  }
+  var sourceComplete = typeof source === 'string' && source.length <= MAX_SOURCE_CHARS;
   return { ref: args.ref, subject: message.subject(), sender: message.sender(),
     to: message.toRecipients().map(function (recipient) { return recipient.address(); }),
     cc: message.ccRecipients().map(function (recipient) { return recipient.address(); }),
     // Mail drops recipients that are the account's own addresses; the server merges them back from headers.
     headers: allHeaders(message),
+    source: sourceComplete ? source : undefined, source_truncated: !sourceComplete,
     body: content.slice(0, args.max_chars), truncated: content.length > args.max_chars,
     attachments: message.mailAttachments().map(attachmentInfo) };
 }
@@ -409,11 +443,18 @@ function setStatus(mail, args) {
   return mutation(function () {
     if (typeof args.read === 'boolean') message.readStatus = args.read;
     if (typeof args.flagged === 'boolean') message.flaggedStatus = args.flagged;
-    var read = message.readStatus();
-    var flagged = message.flaggedStatus();
-    requireValue((args.read == null || read === args.read) && (args.flagged == null || flagged === args.flagged),
-      'Status verification failed');
-    return { ref: args.ref, read: read, flagged: flagged };
+    var stable = 0;
+    for (var poll = 0; poll < STATUS_POLLS; poll += 1) {
+      pause(0.5);
+      // JXA can return cached properties on the object used for the setters.
+      var current = messageFor(mail, args.ref);
+      var read = current.readStatus();
+      var flagged = current.flaggedStatus();
+      var matches = (args.read == null || read === args.read) && (args.flagged == null || flagged === args.flagged);
+      stable = matches ? stable + 1 : 0;
+      if (stable >= STATUS_SETTLE_POLLS) return { ref: args.ref, read: read, flagged: flagged };
+    }
+    requireValue(false, 'Status verification failed; requested state did not settle');
   });
 }
 
@@ -547,6 +588,8 @@ function createDraft(mail, args) {
   var draft = mail.OutgoingMessage({ subject: args.subject, content: args.body, sender: args.sender, visible: false });
   var copy = mutation(function () {
     mail.outgoingMessages.push(draft);
+    draft.messageSignature = null;
+    draft.content = args.body;
     args.to.forEach(function (value) { draft.toRecipients.push(mail.ToRecipient({ address: value })); });
     args.cc.forEach(function (value) { draft.ccRecipients.push(mail.CcRecipient({ address: value })); });
     args.bcc.forEach(function (value) { draft.bccRecipients.push(mail.BccRecipient({ address: value })); });
@@ -561,7 +604,7 @@ function quoted(message) {
     .concat(content.length > MAX_QUOTE_CHARS ? ['[…]'] : []);
   var date = (message.dateSent() || message.dateReceived())
     .toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
-  return '\n\nOn ' + date + ', ' + message.sender() + ' wrote:\n\n' +
+  return 'On ' + date + ', ' + message.sender() + ' wrote:\n\n' +
     lines.map(function (line) { return '> ' + line; }).join('\n');
 }
 
@@ -575,7 +618,7 @@ function replyDraft(mail, args) {
     return boxIdentity(draft.mailbox()).account_id === args.ref.account_id;
   }), 'Cannot reply to a saved draft. Select a received message, or use create_draft for a new draft');
   checkBodySize(message);
-  var content = args.body + quoted(message);
+  var content = (args.body ? args.body + '\n\n' : '') + quoted(message);
   var expected = { account_id: args.ref.account_id, sender: args.sender, body: args.body,
     known: mail.draftsMailbox().messages.id(), open_window: args.open_window };
   var copy = mutation(function () {
@@ -584,6 +627,7 @@ function replyDraft(mail, args) {
     // quote over scripted content. Hidden replies keep scripted content but lose Mail's quote, hence quoted().
     draft.visible = false;
     draft.sender = args.sender;
+    draft.messageSignature = null;
     draft.content = content;
     return saveDraft(mail, draft, Object.assign({}, expected, { subject: draft.subject() }));
   });
@@ -603,6 +647,7 @@ function dispatch(mail, operation, args) {
   switch (operation) {
   case 'list_accounts': return listAccounts(mail);
   case 'list_mailboxes': return listMailboxes(mail, args);
+  case 'trash_destination': return trashDestination(mail, args);
   case 'list_messages': return listMessages(mail, args);
   case 'search_messages': return searchMessages(mail, args);
   case 'read_message': return readMessage(mail, args);

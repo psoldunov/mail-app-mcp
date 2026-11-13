@@ -39,12 +39,12 @@ class Draft(Input):
 
 class AccountPolicy(Input):
     trash_mailbox: Mailbox | None = None
-    allowed_destinations: tuple[Mailbox, ...] = ()
+    allowed_destinations: tuple[Mailbox, ...] | None = None
 
     @field_validator("allowed_destinations")
     @classmethod
     def bounded_destinations(cls, value):
-        if len(value) > 100:
+        if value is not None and len(value) > 100:
             raise ValueError("At most 100 destinations per account")
         return value
 
@@ -66,8 +66,8 @@ class Settings(Input):
         target = tuple(path)
         if any(re.sub(r"\s+", " ", part.strip().casefold()) in FORBIDDEN_FOLDERS for part in target):
             raise ValueError("Sending mailboxes cannot be move destinations")
-        if policy is None or target not in (*policy.allowed_destinations, policy.trash_mailbox):
-            configured = () if policy is None else tuple(
+        if policy is not None and policy.allowed_destinations is not None and target not in (*policy.allowed_destinations, policy.trash_mailbox):
+            configured = tuple(
                 path for path in (*policy.allowed_destinations, policy.trash_mailbox) if path is not None
             )
             raise ValueError(
@@ -77,8 +77,8 @@ class Settings(Input):
             )
         return list(target)
 
-    def trash(self, account_id: str) -> list[str]:
+    def trash(self, account_id: str) -> list[str] | None:
         policy = self.accounts.get(account_id)
         if policy is None or policy.trash_mailbox is None:
-            raise ValueError("Trash mailbox is not configured for this account")
+            return None
         return self.destination(account_id, policy.trash_mailbox)

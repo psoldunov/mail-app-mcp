@@ -25,6 +25,8 @@ class FixtureMail:
                 {"account_id": "work", "name": "Mail", "email_addresses": ["work@example.org"]},
                 {"account_id": "personal", "name": "Mail", "email_addresses": ["home@example.org"]},
             ]}
+        if operation == "trash_destination":
+            return {"account_id": args["account_id"], "destination": ["Deleted Items"]}
         if self.fail_write:
             raise OutcomeUnknown("Do not retry")
         if operation == "create_draft":
@@ -67,8 +69,110 @@ def test_trash_moves_only_to_owners_configured_account_mailbox(tmp_path):
     server = create_server(settings, mail, tmp_path)
     assert call(server, "trash_message", {"ref": REF})["destination"] == ["Deleted Messages"]
     assert mail.requests[-1][0] == "move_message"
+    assert call(server, "trash_message", {"ref": {**REF, "account_id": "personal"}})["destination"] == ["Deleted Items"]
+
+
+def test_default_moves_and_discovered_trash_respect_explicit_restrictions(tmp_path):
+    mail = FixtureMail()
+    server = create_server(bridge=mail, state_dir=tmp_path)
+    assert call(server, "move_message", {"ref": REF, "destination": ["Archive"]})["destination"] == ["Archive"]
+    assert call(server, "trash_message", {"ref": REF})["destination"] == ["Deleted Items"]
+    settings = Settings.model_validate({"accounts": {"work": {"allowed_destinations": []}}})
+    restricted = create_server(settings, mail, tmp_path)
+    writes_before = len([op for op, _ in mail.requests if op == "move_message"])
     with pytest.raises(Exception, match="configured"):
-        call(server, "trash_message", {"ref": {**REF, "account_id": "personal"}})
+        call(restricted, "trash_message", {"ref": REF})
+    assert len([op for op, _ in mail.requests if op == "move_message"]) == writes_before
+
+
+@pytest.mark.parametrize("discovered", [
+    {"account_id": "personal", "destination": ["Trash"]},
+    {"account_id": "work", "destination": []},
+    {"account_id": "work", "destination": ["Outbox"]},
+])
+def test_invalid_trash_discovery_never_attempts_write(tmp_path, discovered):
+    class InvalidTrash(FixtureMail):
+        def call(self, operation, args):
+            if operation == "trash_destination":
+                return discovered
+            return super().call(operation, args)
+    mail = InvalidTrash()
+    with pytest.raises(Exception):
+        call(create_server(bridge=mail, state_dir=tmp_path), "trash_message", {"ref": REF})
+    assert not mail.requests
+    assert not (tmp_path / "write-uncertain").exists()
+
+
+def test_read_message_preserves_html_link_targets_without_exposing_source(tmp_path):
+    from email.message import EmailMessage
+
+    source = EmailMessage()
+    source.set_content("See the requests here")
+    source.add_alternative('<p>See <a href="https://example.org/dashboard?a=1&amp;b=2">the <b>requests</b> here</a>'
+                           '<a href="javascript:alert(1)">unsafe</a></p>', subtype="html", cte="base64")
+
+    class LinkedMail(FixtureMail):
+        def call(self, operation, args):
+            return {"body": "See the requests here", "source": source.as_string(), "source_truncated": False}
+
+    result = call(create_server(bridge=LinkedMail(), state_dir=tmp_path), "read_message", {"ref": REF})
+    assert result["links"] == [{"url": "https://example.org/dashboard?a=1&b=2", "text": "the requests here"}]
+    assert result["body"] == "See the requests here"
+    assert result["links_truncated"] is False
+    assert "source" not in result and "source_truncated" not in result
+
+
+@pytest.mark.parametrize(("source", "truncated", "expected_incomplete"), [
+    (None, False, True),
+    ("Content-Type: text/plain\n\nNo links", False, False),
+    ("Content-Type: text/html\n\n<a href='https://example.org'>partial", True, True),
+    ("x" * 100_001, False, True),
+    ("Content-Type: text/html; charset=made-up-charset\n\n<a href='https://example.org'>x</a>", False, True),
+])
+def test_read_message_reports_incomplete_link_extraction(tmp_path, source, truncated, expected_incomplete):
+    class SourceMail(FixtureMail):
+        def call(self, operation, args):
+            return {"source": source, "source_truncated": truncated}
+
+    result = call(create_server(bridge=SourceMail(), state_dir=tmp_path), "read_message", {"ref": REF})
+    assert result["links"] == []
+    assert result["links_truncated"] is expected_incomplete
+    assert "source" not in result
+
+
+def test_read_message_bounds_links_and_ignores_html_attachments(tmp_path):
+    from email.message import EmailMessage
+
+    source = EmailMessage()
+    source.set_content("plain")
+    source.add_alternative("".join(f'<a href="https://example.org/{i}">{"x" * 300}</a>' for i in range(101)), subtype="html")
+    source.add_attachment('<a href="https://attachment.org">attached</a>', subtype="html", filename="attached.html")
+
+    class ManyLinks(FixtureMail):
+        def call(self, operation, args):
+            return {"source": source.as_string()}
+
+    result = call(create_server(bridge=ManyLinks(), state_dir=tmp_path), "read_message", {"ref": REF})
+    assert len(result["links"]) == 100
+    assert result["links"][0] == {"url": "https://example.org/0", "text": "x" * 256}
+    assert result["links"][-1]["url"] == "https://example.org/99"
+    assert result["links_truncated"] is True
+
+
+def test_deeply_nested_mime_does_not_hide_plain_body(tmp_path):
+    source = "Content-Type: text/html\n\n<a href='https://example.org'>link</a>"
+    for index in range(1200):
+        source = f'Content-Type: multipart/mixed; boundary="b{index}"\n\n--b{index}\n{source}\n--b{index}--\n'
+    # Nested MIME can exhaust recursion despite being below the source size limit.
+    assert len(source) < 100_000
+
+    class NestedMail(FixtureMail):
+        def call(self, operation, args):
+            return {"source": source, "body": "Still readable"}
+
+    result = call(create_server(bridge=NestedMail(), state_dir=tmp_path), "read_message", {"ref": REF})
+    assert result["body"] == "Still readable"
+    assert result["links"] == [] and result["links_truncated"] is True
 
 
 def test_unknown_write_outcome_blocks_following_writes(tmp_path):
@@ -248,7 +352,7 @@ def test_denied_move_explains_allowed_paths_without_attempting_a_write(tmp_path)
     mail = FixtureMail()
     settings = Settings.model_validate({"accounts": {"work": {
         "allowed_destinations": [["Projects", "2026"]], "trash_mailbox": ["Deleted Messages"],
-    }}})
+    }, "personal": {"allowed_destinations": []}}})
     server = create_server(settings, mail, tmp_path)
     with pytest.raises(Exception) as denied:
         call(server, "move_message", {"ref": REF, "destination": ["Inbox"]})
