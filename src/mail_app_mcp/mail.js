@@ -158,20 +158,27 @@ function listMailboxes(mail, args) {
   return { mailboxes: result };
 }
 
-function summary(message, args) {
-  var identity = boxIdentity(message.mailbox());
-  requireValue(identity.account_id === args.account_id, 'Message account changed');
-  // Gmail label views can enumerate a message whose owning mailbox is All Mail.
-  return { ref: { account_id: args.account_id, mailbox: identity.mailbox,
+function summary(message, accountId, mailbox) {
+  return { ref: { account_id: accountId, mailbox: mailbox,
     message_id: message.id(), header_message_id: message.messageId() },
   subject: message.subject(), sender: message.sender(), date_received: message.dateReceived().toISOString(),
   read: message.readStatus(), flagged: message.flaggedStatus() };
 }
 
+function bulkIds(messages) {
+  try { return messages.id(); }
+  catch (error) {
+    // Mail cannot bulk-read some empty special mailboxes, such as Gmail's Notes, but counts them as empty.
+    if (error.errorNumber === -1728 && messages.length === 0) return [];
+    throw error;
+  }
+}
+
 function mailboxSnapshot(box) {
   // One whole-mailbox property read is a single Apple event; index and range reads cost one per message.
   var messages = box.messages;
-  var ids = messages.id();
+  var ids = bulkIds(messages);
+  if (!ids.length) return { ids: [], subjects: [], senders: [], dates: [], read: [], flagged: [], messageIds: [] };
   var snapshot = { ids: ids, subjects: messages.subject(), senders: messages.sender(),
     dates: messages.dateReceived(), read: messages.readStatus(), flagged: messages.flaggedStatus(),
     messageIds: messages.messageId() };
@@ -217,21 +224,32 @@ function listMessages(mail, args) {
     scanned: index - start, stopped: stopped };
 }
 
+// Gmail lists one message under several labels; refs prefer INBOX, then other labels, then All Mail.
+function labelRank(name) {
+  var normalized = String(name).toLowerCase();
+  return normalized === 'inbox' ? 0 : normalized === 'all mail' ? 2 : 1;
+}
+
 function searchBoxes(mail, args) {
-  if (args.mailbox) return [{ box: boxFor(mail, args.account_id, args.mailbox), account_id: args.account_id }];
+  if (args.mailbox) {
+    return [{ box: boxFor(mail, args.account_id, args.mailbox), account_id: args.account_id, rank: 0 }];
+  }
   var accounts = args.account_id === '__local__' ? [] :
     (args.account_id ? [accountFor(mail, args.account_id)] : mail.accounts());
   var boxes = accounts.reduce(function (result, account) {
     var id = account.id();
     var items = account.mailboxes();
     requireValue(result.length + items.length <= MAX_BOXES, 'Search scope exceeds 1000 mailboxes; narrow account_id or mailbox');
-    return result.concat(items.map(function (box) { return { box: box, account_id: id }; }));
+    var names = account.mailboxes.name();
+    return result.concat(items.map(function (box, index) {
+      return { box: box, account_id: id, rank: labelRank(names[index]) };
+    }));
   }, []);
   if (!args.account_id || args.account_id === '__local__') {
     var local = mail.mailboxes();
     requireValue(local.length <= MAX_BOXES, 'Local mailbox inventory exceeds 1000 mailboxes');
     boxes = boxes.concat(local.filter(function (box) { return !box.account(); }).map(function (box) {
-      return { box: box, account_id: '__local__' };
+      return { box: box, account_id: '__local__', rank: 1 };
     }));
   }
   requireValue(boxes.length <= MAX_BOXES, 'Search scope exceeds 1000 mailboxes; narrow account_id or mailbox');
@@ -243,20 +261,26 @@ function searchDeadline(deadline) {
 }
 
 function searchCandidates(scope, sender, remaining) {
-  // Mail evaluates this predicate; never fetch subjects or bodies for nonmatches.
-  var selected = sender ? scope.box.messages.whose({ sender: { _contains: sender } }) : scope.box.messages;
-  var count = selected.length;
-  requireValue(integer(count, 0, remaining), 'Search exceeds 20000 matching headers; narrow account_id, mailbox or from');
-  if (!count) return [];
-  var ids = selected.id();
-  var dates = selected.dateReceived();
-  requireValue(Array.isArray(ids) && Array.isArray(dates) && ids.length === count && dates.length === count &&
-    JSON.stringify(selected.id()) === JSON.stringify(ids), 'Mailbox changed while searching; retry search');
-  return ids.map(function (id, index) {
+  // Whole-mailbox reads filtered here; Mail's whose clause rescans the mailbox for every property read.
+  // Subjects and bodies of nonmatches are never fetched.
+  var messages = scope.box.messages;
+  var ids = bulkIds(messages);
+  if (!ids.length) return [];
+  var senders = sender ? messages.sender() : ids;
+  var dates = messages.dateReceived();
+  requireValue(Array.isArray(ids) && Array.isArray(senders) && Array.isArray(dates) &&
+    senders.length === ids.length && dates.length === ids.length &&
+    JSON.stringify(messages.id()) === JSON.stringify(ids), 'Mailbox changed while searching; retry search');
+  var needle = sender.toLowerCase();
+  var matches = ids.map(function (id, index) { return index; }).filter(function (index) {
+    return !sender || (typeof senders[index] === 'string' && senders[index].toLowerCase().indexOf(needle) !== -1);
+  });
+  requireValue(matches.length <= remaining, 'Search exceeds 20000 matching headers; narrow account_id, mailbox or from');
+  return matches.map(function (index) {
     var date = dates[index];
-    requireValue(integer(id, 1, Number.MAX_SAFE_INTEGER) && date && typeof date.getTime === 'function' &&
+    requireValue(integer(ids[index], 1, Number.MAX_SAFE_INTEGER) && date && typeof date.getTime === 'function' &&
       Number.isFinite(date.getTime()), 'Invalid message ID or received date; latest match not established');
-    return { scope: scope, id: id, timestamp: date.getTime() };
+    return { scope: scope, id: ids[index], timestamp: date.getTime() };
   });
 }
 
@@ -271,7 +295,7 @@ function searchMessages(mail, args) {
     return result.concat(searchCandidates(scope, args.from, MAX_SEARCH_MATCHES - result.length));
   }, []);
   var unique = candidates.slice().sort(function (a, b) {
-    return a.scope.account_id.localeCompare(b.scope.account_id) || a.id - b.id;
+    return a.scope.account_id.localeCompare(b.scope.account_id) || a.id - b.id || a.scope.rank - b.scope.rank;
   }).filter(function (candidate, index, all) {
     var previous = all[index - 1];
     if (!previous || previous.scope.account_id !== candidate.scope.account_id || previous.id !== candidate.id) return true;
@@ -285,11 +309,14 @@ function searchMessages(mail, args) {
   searchDeadline(deadline);
   var filtered = Date.now();
   var found = [];
+  var paths = new Map();
   for (var index = 0; index < ordered.length && found.length < args.limit; index += 1) {
     searchDeadline(deadline);
     var candidate = ordered[index];
-    var message = one(candidate.scope.box.messages.whose({ id: candidate.id })(), 'Search result');
-    var item = summary(message, candidate.scope);
+    // byId is a direct reference; a whose lookup would rescan the mailbox for each result.
+    var message = candidate.scope.box.messages.byId(candidate.id);
+    if (!paths.has(candidate.scope)) paths.set(candidate.scope, boxIdentity(candidate.scope.box).mailbox);
+    var item = summary(message, candidate.scope.account_id, paths.get(candidate.scope));
     requireValue(item.ref.message_id === candidate.id && Date.parse(item.date_received) === candidate.timestamp &&
       (!args.from || item.sender.toLowerCase().indexOf(args.from.toLowerCase()) !== -1),
     'Message changed while searching; retry search');
@@ -423,29 +450,37 @@ function verifySender(mail, accountId, sender) {
 function pause(seconds) { $.NSThread.sleepForTimeInterval(seconds); }
 function squash(text) { return String(text).replace(/\s+/g, ''); }
 
+function inspectCopy(drafts, id, expected) {
+  try {
+    var message = drafts.messages.whose({ id: id })().filter(function (candidate) {
+      return boxIdentity(candidate.mailbox()).account_id === expected.account_id &&
+        squash(candidate.subject()) === squash(expected.subject);
+    })[0];
+    if (!message) return null;
+    if (squash(message.content()).indexOf(squash(expected.body)) === -1) return { copy: null };
+    var identity = boxIdentity(message.mailbox());
+    return { copy: { message: message, ref: { account_id: identity.account_id, mailbox: identity.mailbox,
+      message_id: message.id(), header_message_id: message.messageId() } } };
+  } catch (error) {
+    // Mail deletes its first copy when the copy with the body replaces it.
+    if (error.errorNumber === -1728) return null;
+    throw error;
+  }
+}
+
 function savedCopy(mail, expected) {
   // Mail writes the saved copy into Drafts asynchronously and may add a signature or line spacing.
   var drafts = mail.draftsMailbox();
   var deadline = Date.now() + SAVED_DRAFT_WAIT_MS;
   var withoutBody = false;
   while (Date.now() < deadline) {
-    var fresh = drafts.messages.id().filter(function (id) { return expected.known.indexOf(id) === -1; })
-      .sort(function (a, b) { return b - a; });
-    var candidates = [].concat.apply([], fresh.map(function (id) {
-      return drafts.messages.whose({ id: id })().filter(function (message) {
-        return boxIdentity(message.mailbox()).account_id === expected.account_id &&
-          squash(message.subject()) === squash(expected.subject);
-      });
-    }));
-    var match = candidates.filter(function (message) {
-      return squash(message.content()).indexOf(squash(expected.body)) !== -1;
-    })[0];
-    if (match) {
-      var identity = boxIdentity(match.mailbox());
-      return { message: match, ref: { account_id: identity.account_id, mailbox: identity.mailbox,
-        message_id: match.id(), header_message_id: match.messageId() } };
-    }
-    withoutBody = candidates.length > 0;
+    var seen = drafts.messages.id().filter(function (id) { return expected.known.indexOf(id) === -1; })
+      .sort(function (a, b) { return b - a; })
+      .map(function (id) { return inspectCopy(drafts, id, expected); })
+      .filter(Boolean);
+    var match = seen.filter(function (item) { return item.copy; })[0];
+    if (match) return match.copy;
+    withoutBody = seen.length > 0;
     pause(0.25);
   }
   requireValue(!withoutBody, 'Mail saved this draft without the requested body and did not replace it within ' +
@@ -453,36 +488,46 @@ function savedCopy(mail, expected) {
   return null;
 }
 
+// Runs inside the caller's mutation: a wrong sender or a lost body is a bad saved draft.
 function saveDraft(mail, draft, expected) {
   mail.save(draft);
   requireValue(draft.sender() === expected.sender, 'Draft sender changed after saving');
-  var saved = savedCopy(mail, expected);
-  var result = { status: 'draft', account_id: expected.account_id, sender: expected.sender, ref: saved && saved.ref };
-  if (!saved) {
+  return savedCopy(mail, expected);
+}
+
+// Runs after the mutation: the draft is saved, so failing to open a window is not an uncertain write.
+function draftResult(mail, copy, expected) {
+  var result = { status: 'draft', account_id: expected.account_id, sender: expected.sender, ref: copy && copy.ref };
+  if (!copy) {
     return Object.assign(result, { warning: 'Saved, but the copy did not appear in Drafts within ' +
       SAVED_DRAFT_WAIT_MS / 1000 + ' seconds' +
       (expected.open_window ? ', so no window was opened' : '') + '. Do not retry; find it with list_messages on Drafts.' });
   }
-  // Mail cannot reshow a hidden compose window, so open the saved copy instead.
-  if (expected.open_window) {
-    mail.open(saved.message);
+  if (!expected.open_window) return result;
+  try {
+    // Mail cannot reshow a hidden compose window, so open the saved copy instead.
+    mail.open(copy.message);
     mail.activate();
+    return result;
+  } catch (error) {
+    return Object.assign(result, { warning: 'Saved, but Mail could not open it: ' +
+      String(error.message || error).slice(0, 200) + '. Do not retry; open it with show_message.' });
   }
-  return result;
 }
 
 function createDraft(mail, args) {
   verifySender(mail, args.account_id, args.sender);
-  var known = mail.draftsMailbox().messages.id();
+  var expected = { account_id: args.account_id, sender: args.sender, subject: args.subject, body: args.body,
+    known: mail.draftsMailbox().messages.id(), open_window: args.open_window };
   var draft = mail.OutgoingMessage({ subject: args.subject, content: args.body, sender: args.sender, visible: false });
-  return mutation(function () {
+  var copy = mutation(function () {
     mail.outgoingMessages.push(draft);
     args.to.forEach(function (value) { draft.toRecipients.push(mail.ToRecipient({ address: value })); });
     args.cc.forEach(function (value) { draft.ccRecipients.push(mail.CcRecipient({ address: value })); });
     args.bcc.forEach(function (value) { draft.bccRecipients.push(mail.BccRecipient({ address: value })); });
-    return saveDraft(mail, draft, { account_id: args.account_id, sender: args.sender, subject: args.subject,
-      body: args.body, known: known, open_window: args.open_window });
+    return saveDraft(mail, draft, expected);
   });
+  return draftResult(mail, copy, expected);
 }
 
 function quoted(message) {
@@ -506,17 +551,18 @@ function replyDraft(mail, args) {
   }), 'Cannot reply to a saved draft. Select a received message, or use create_draft for a new draft');
   checkBodySize(message);
   var content = args.body + quoted(message);
-  var known = mail.draftsMailbox().messages.id();
-  return mutation(function () {
+  var expected = { account_id: args.ref.account_id, sender: args.sender, body: args.body,
+    known: mail.draftsMailbox().messages.id(), open_window: args.open_window };
+  var copy = mutation(function () {
     var draft = mail.reply(message, { openingWindow: false, replyToAll: args.reply_all });
     // Mail opens reply windows regardless of openingWindow, and a visible compose view autosaves its own
     // quote over scripted content. Hidden replies keep scripted content but lose Mail's quote, hence quoted().
     draft.visible = false;
     draft.sender = args.sender;
     draft.content = content;
-    return saveDraft(mail, draft, { account_id: args.ref.account_id, sender: args.sender, subject: draft.subject(),
-      body: args.body, known: known, open_window: args.open_window });
+    return saveDraft(mail, draft, Object.assign({}, expected, { subject: draft.subject() }));
   });
+  return draftResult(mail, copy, expected);
 }
 
 function showMessage(mail, args) {

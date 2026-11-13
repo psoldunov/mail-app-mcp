@@ -24,9 +24,12 @@ def extract_content(path: Path, mime: str) -> dict:
             result = subprocess.run(
                 [sys.executable, "-m", "mail_app_mcp.pdf_text", str(path)],
                 capture_output=True, text=True, timeout=10, shell=False,
+                # The Nix wrapper adds this package and pypdf to sys.path in-process only; the child needs them too.
+                env={**os.environ, "PYTHONPATH": os.pathsep.join(entry for entry in sys.path if entry)},
             )
             if result.returncode != 0:
-                raise ValueError("PDF extraction failed or exceeded resource limits")
+                cause = (result.stderr.strip().splitlines() or ["no error output"])[-1][:200]
+                raise ValueError(f"PDF extraction failed or exceeded resource limits ({cause})")
             content = json.loads(result.stdout)
             if not isinstance(content, dict) or "text" not in content:
                 raise ValueError("PDF extraction failed; encrypted, malformed, or unsupported document")
