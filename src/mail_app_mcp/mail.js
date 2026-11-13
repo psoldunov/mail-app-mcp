@@ -12,8 +12,11 @@ var SEARCH_BUDGET_MS = 10000;
 // A hidden reply's first saved copy is Mail's own quote; the copy with the scripted body replaced it
 // 5-15 s later in live runs.
 var SAVED_DRAFT_WAIT_MS = 30000;
+// After the second save, five one-second polls without a newer copy settle the returned ref.
+var SECOND_SAVE_AFTER_MS = 3000;
+var SETTLE_POLLS = 5;
 var MAX_SEARCH_MATCHES = 20000;
-// A cold first search over ~40 Gmail mailboxes took 20 s; warm ones take ~4 s. The bridge stops at 45 s.
+// A cold first search over ~40 Gmail mailboxes took 20 s; warm ones take ~4 s. The bridge stops at 60 s.
 var GLOBAL_SEARCH_BUDGET_MS = 35000;
 
 function requireValue(condition, message) {
@@ -305,7 +308,9 @@ function searchMessages(mail, args) {
   });
   var ordered = unique.slice().sort(function (a, b) {
     var dateOrder = args.sort === 'newest' ? b.timestamp - a.timestamp : a.timestamp - b.timestamp;
-    return dateOrder || a.scope.account_id.localeCompare(b.scope.account_id) || a.id - b.id;
+    // Within one account, a higher Mail ID arrived later, so it breaks a received-time tie.
+    return dateOrder || a.scope.account_id.localeCompare(b.scope.account_id) ||
+      (args.sort === 'newest' ? b.id - a.id : a.id - b.id);
   });
   searchDeadline(deadline);
   var filtered = Date.now();
@@ -469,21 +474,27 @@ function inspectCopy(drafts, id, expected) {
   }
 }
 
-function savedCopy(mail, expected) {
-  // Mail writes the saved copy into Drafts asynchronously and may add a signature or line spacing.
+function savedCopy(mail, expected, deadline, settlePolls) {
+  // Mail writes the saved copy into Drafts asynchronously and may add a signature or line spacing. It can
+  // also replace a copy that has the body with another one seconds later, so wait for the newest to settle.
   var drafts = mail.draftsMailbox();
-  var deadline = Date.now() + SAVED_DRAFT_WAIT_MS;
   var withoutBody = false;
+  var found = null;
+  var stablePolls = 0;
   while (Date.now() < deadline) {
     var seen = drafts.messages.id().filter(function (id) { return expected.known.indexOf(id) === -1; })
       .sort(function (a, b) { return b - a; })
       .map(function (id) { return inspectCopy(drafts, id, expected); })
       .filter(Boolean);
     var match = seen.filter(function (item) { return item.copy; })[0];
-    if (match) return match.copy;
-    withoutBody = seen.length > 0;
-    pause(0.25);
+    var same = match && found && match.copy.ref.message_id === found.ref.message_id;
+    stablePolls = same ? stablePolls + 1 : 0;
+    found = match ? match.copy : null;
+    if (found && stablePolls >= settlePolls) return found;
+    withoutBody = seen.length > 0 && !found;
+    pause(found ? 1 : 0.25);
   }
+  if (found) return found;
   requireValue(!withoutBody, 'Mail saved this draft without the requested body and did not replace it within ' +
     SAVED_DRAFT_WAIT_MS / 1000 + ' seconds. Check Drafts in Mail before retrying');
   return null;
@@ -491,9 +502,19 @@ function savedCopy(mail, expected) {
 
 // Runs inside the caller's mutation: a wrong sender or a lost body is a bad saved draft.
 function saveDraft(mail, draft, expected) {
+  var savedAt = Date.now();
+  var deadline = savedAt + SAVED_DRAFT_WAIT_MS;
   mail.save(draft);
   requireValue(draft.sender() === expected.sender, 'Draft sender changed after saving');
-  return savedCopy(mail, expected);
+  var first = savedCopy(mail, expected, deadline, 0);
+  if (!first) return null;
+  // Mail finishes the signature after a save, and the hidden window then re-saves the draft about 20 s later
+  // under new IDs, which kills the returned ref. A second save once that settles leaves nothing to re-save.
+  pause(Math.max(0, savedAt + SECOND_SAVE_AFTER_MS - Date.now()) / 1000);
+  mail.save(draft);
+  // The second save replaces the first copy; fall back to it only if no newer copy appears in time.
+  var known = expected.known.concat([first.ref.message_id]);
+  return savedCopy(mail, Object.assign({}, expected, { known: known }), deadline, SETTLE_POLLS) || first;
 }
 
 // Runs after the mutation: the draft is saved, so failing to open a window is not an uncertain write.
