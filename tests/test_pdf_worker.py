@@ -46,3 +46,51 @@ pdf_text.main()
 
     assert result.returncode == 1, result.stderr
     assert result.stdout == "parser started with CPU limit\n"
+
+
+@pytest.mark.parametrize("mapping,expected", [
+    (b"<2B> <0000> <2D> <0000> <28> <0000> <29> <0000>", {
+        "error": "PDF text contains unmapped characters; reliable extraction is unavailable",
+    }),
+    (b"<2B> <002B> <2D> <002D> <28> <0028> <29> <0029>", {
+        "text": "INV-2026 (Usage) +$10.00", "pages": 1, "truncated": False,
+    }),
+])
+def test_pdf_worker_preserves_punctuation_or_rejects_unmapped_glyphs(tmp_path, mapping, expected):
+    from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
+    from mail_app_mcp.pdf_text import extract_pdf
+
+    # Synthetic invoice: identical visible glyphs with valid or broken Unicode mappings.
+    writer = PdfWriter()
+    page = writer.add_blank_page(width=400, height=100)
+    cmap = DecodedStreamObject()
+    cmap.set_data(b"""/CIDInit /ProcSet findresource begin 12 dict begin begincmap
+/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def
+/CMapName /Synthetic def /CMapType 2 def
+1 begincodespacerange <00> <FF> endcodespacerange
+4 beginbfchar """ + mapping + b""" endbfchar
+endcmap CMapName currentdict /CMap defineresource pop end end""")
+    font = DictionaryObject({
+        NameObject("/Type"): NameObject("/Font"),
+        NameObject("/Subtype"): NameObject("/Type1"),
+        NameObject("/BaseFont"): NameObject("/Helvetica"),
+        NameObject("/Encoding"): NameObject("/WinAnsiEncoding"),
+        NameObject("/ToUnicode"): writer._add_object(cmap),
+    })
+    page[NameObject("/Resources")] = DictionaryObject({
+        NameObject("/Font"): DictionaryObject({NameObject("/F1"): writer._add_object(font)}),
+    })
+    stream = DecodedStreamObject()
+    stream.set_data(br"BT /F1 12 Tf 20 50 Td (INV-2026 \(Usage\) +$10.00) Tj ET")
+    page[NameObject("/Contents")] = writer._add_object(stream)
+    path = tmp_path / "invoice.pdf"
+    writer.write(path)
+
+    result = subprocess.run(
+        [sys.executable, "-m", "mail_app_mcp.pdf_text", str(path)],
+        capture_output=True, text=True, timeout=10,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == expected
+    assert extract_pdf(path) == expected

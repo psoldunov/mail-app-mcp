@@ -55,7 +55,14 @@ function fixture(count = 1) {
   }
   account.mailboxes = collection([inbox, archive, outbox, draftbox, sentbox]);
   const mail = { accounts: collection([account]), mailboxes: collection([]),
-    outbox: () => outbox, draftsMailbox: () => draftbox, sentMailbox: () => sentbox };
+    outbox: () => outbox, draftsMailbox: () => draftbox, sentMailbox: () => sentbox,
+    move(message, { to }) {
+      const source = message.mailbox();
+      const id = message.id();
+      message.mailbox = to;
+      source.messages = collection(source.messages().filter((item) => item.id() !== id));
+      to.messages = collection([...to.messages(), message]);
+    } };
   return { mail, account, inbox, archive, outbox, draftbox, sentbox, messages,
     ref: { account_id: 'a1', mailbox: ['Inbox'], message_id: 1, header_message_id: '<1@example.com>' } };
 }
@@ -270,14 +277,14 @@ test('reads bounded body only after exact reference validation', () => {
   assert.equal(messages[0].readStatus(), false);
 });
 
-test('read returns complete small MIME sources but omits oversized sources explicitly', () => {
+test('read keeps a bounded MIME prefix independently of the body budget', () => {
   const { mail, ref, messages } = fixture();
   const args = { ref, max_chars: 4 };
   assert.equal(dispatch(mail, 'read_message', args).source, messages[0].source());
   assert.equal(dispatch(mail, 'read_message', args).source_truncated, false);
   messages[0].source = 'x'.repeat(100001);
   const large = dispatch(mail, 'read_message', args);
-  assert.equal(large.source, undefined);
+  assert.equal(large.source, 'x'.repeat(100000));
   assert.equal(large.source_truncated, true);
   assert.equal(large.body, 'Body');
   messages[0].source = 'x'.repeat(100000);
@@ -390,6 +397,60 @@ test('moves within account and rejects resolved special destinations and stale s
   assert.equal(messages[0].mailbox().name(), 'Archive');
   inbox.messages = collection([]);
   assert.throws(() => dispatch(mail, 'move_message', { ref, destination: ['Inbox'] }), /missing/i);
+});
+
+test('a cached destination property cannot verify a no-op move', () => {
+  const { mail, ref, messages, archive } = fixture();
+  mail.move = () => { messages[0].mailbox = archive; };
+  assert.throws(() => dispatch(mail, 'move_message', { ref, destination: ['Archive'] }),
+    /Outcome unknown:.*Move verification failed/);
+});
+
+test('overlapping labels and empty Message-IDs are rejected before moving', () => {
+  const { mail, ref, messages, archive } = fixture();
+  archive.messages = collection(messages);
+  mail.move = () => assert.fail('Must not move an overlapping or unidentifiable message');
+  assert.throws(() => dispatch(mail, 'move_message', { ref, destination: ['Archive'] }),
+    (error) => /already contains/.test(error.message) && !/Outcome unknown/.test(error.message));
+  archive.messages = collection([]);
+  messages[0].messageId = '';
+  assert.throws(() => dispatch(mail, 'move_message', { ref: { ...ref, header_message_id: '' }, destination: ['Archive'] }),
+    (error) => /Message-ID/.test(error.message) && !/Outcome unknown/.test(error.message));
+});
+
+test('a move verifies fresh mailbox membership after the source handle disappears', () => {
+  const { mail, ref, messages, inbox, archive } = fixture();
+  const original = messages[0];
+  let moved = false;
+  const stale = new Proxy(original, { get(target, key) {
+    if (moved) throw Object.assign(new Error("Can't get object"), { errorNumber: -1728 });
+    return target[key];
+  }, set() {
+    move();
+    return true;
+  } });
+  function move() {
+    moved = true;
+    inbox.messages = collection([]);
+    archive.messages = collection([scripting({ id: 99, messageId: ref.header_message_id, mailbox: archive })]);
+  }
+  inbox.messages = collection([stale]);
+  mail.move = move;
+  assert.equal(dispatch(mail, 'move_message', { ref, destination: ['Archive'] }).moved, true);
+});
+
+test('a move reporting -1728 is successful only when fresh membership proves it', () => {
+  for (const completed of [true, false]) {
+    const { mail, ref } = fixture();
+    const move = mail.move;
+    mail.move = (message, args) => {
+      if (completed) move(message, args);
+      throw Object.assign(new Error("Can't get object"), { errorNumber: -1728 });
+    };
+    const action = () => dispatch(mail, 'move_message', { ref, destination: ['Archive'] });
+    if (completed) assert.equal(action().moved, true);
+    else assert.throws(action, /Outcome unknown:.*Move verification failed/);
+  }
 });
 
 test('attachment saves reject absent, unavailable and oversize attachments before saving', () => {
@@ -711,7 +772,7 @@ test('draft membership is account-scoped and a failed lookup cannot create a rep
 function runtime(request, processes, application, options = {}) {
   let now = 0;
   const context = vm.createContext({
-    ObjC: { import() {}, unwrap: (value) => value },
+    ObjC: { import() {}, unwrap: (value) => value && value.nilWrapper ? undefined : value },
     Ref: () => [],
     Date: { now: () => now },
     $: { NSUTF8StringEncoding: 4,
@@ -720,6 +781,7 @@ function runtime(request, processes, application, options = {}) {
       NSDictionary: { dictionary: {} },
       NSWorkspaceLaunchWithoutActivation: 512,
       NSWorkspaceLaunchAndHide: 1048576,
+      NSWorkspaceLaunchAsync: 65536,
       NSWorkspace: { sharedWorkspace: {
         URLForApplicationWithBundleIdentifier: (id) => {
           assert.equal(id, 'com.apple.mail');
@@ -759,6 +821,30 @@ test('stdin entrypoint never launches or resolves an application for rejected re
     [{ processIdentifier: 123, terminated: true }], forbidden).error, /running/i);
 });
 
+test('startup refuses reads and writes before scripting a recently launched or unready Mail', () => {
+  const forbidden = () => assert.fail('Starting Mail must not receive Apple events');
+  for (const readiness of [{ finishedLaunching: false }, { finishedLaunching: true,
+    launchDate: { timeIntervalSinceNow: -8 } }]) {
+    for (const request of [{ operation: 'list_accounts', args: {} },
+      { operation: 'move_message', args: { ref: fixture().ref, destination: ['Archive'] } }]) {
+      const result = runtime(request, [{ processIdentifier: 123, terminated: false, ...readiness }], forbidden);
+      assert.equal(result.ok, false);
+      assert.match(result.error, /Mail is starting/);
+      assert.doesNotMatch(result.error, /Outcome unknown/);
+    }
+  }
+  assert.equal(runtime({ operation: 'list_accounts', args: {} },
+    [{ processIdentifier: 123, terminated: false, finishedLaunching: true,
+      launchDate: { timeIntervalSinceNow: -60 } }], () => fixture().mail).ok, true);
+});
+
+test('startup accepts an unavailable launch date wrapped as Objective-C nil', () => {
+  const result = runtime({ operation: 'list_accounts', args: {} },
+    [{ processIdentifier: 123, terminated: false, finishedLaunching: true,
+      launchDate: { nilWrapper: true } }], () => fixture().mail);
+  assert.equal(result.ok, true);
+});
+
 test('stdin entrypoint launches stopped Mail hidden without activation and waits for its PID', () => {
   const { mail } = fixture();
   let launches = 0;
@@ -769,7 +855,7 @@ test('stdin entrypoint launches stopped Mail hidden without activation and waits
     return mail;
   }, { launch(url, options) {
     assert.equal(url, 'file:///System/Applications/Mail.app');
-    assert.equal(options, 512 | 1048576);
+    assert.equal(options, 512 | 1048576 | 65536);
     launches += 1;
     return {};
   } });

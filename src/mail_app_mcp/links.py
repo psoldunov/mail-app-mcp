@@ -1,5 +1,6 @@
 """Bounded HTML link extraction from Mail's MIME source; never fetches URLs."""
 
+import base64
 import email
 import email.policy
 from html.parser import HTMLParser
@@ -55,17 +56,25 @@ class Links(HTMLParser):
 
 
 def message_links(source: str | None, truncated: bool = False) -> dict:
-    if not source or truncated or len(source) > MAX_SOURCE_CHARS:
+    if not source or len(source) > MAX_SOURCE_CHARS:
         return {"links": [], "links_truncated": True}
     parser = Links()
     try:
         message = email.message_from_string(source, policy=email.policy.default)
         part = message.get_body(preferencelist=("html",))
         if part is None:
-            return {"links": [], "links_truncated": False}
-        parser.feed(part.get_content())
+            return {"links": [], "links_truncated": truncated}
+        if truncated and part.get("Content-Transfer-Encoding", "").lower() == "base64":
+            payload = "".join(part.get_payload().split())
+            # A cut base64 quantum can make the MIME decoder return the entire payload undecoded.
+            content = base64.b64decode(payload[:len(payload) // 4 * 4], validate=True).decode(
+                part.get_content_charset() or "ascii", errors="replace")
+        else:
+            content = part.get_content()
+        parser.feed(content)
         parser.close()
-        parser.handle_endtag("a")
+        if not truncated:
+            parser.handle_endtag("a")
     except (LookupError, ValueError, RecursionError):
         return {"links": [], "links_truncated": True}
-    return {"links": parser.links, "links_truncated": parser.truncated}
+    return {"links": parser.links, "links_truncated": truncated or parser.truncated}

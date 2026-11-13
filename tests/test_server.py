@@ -140,6 +140,38 @@ def test_read_message_reports_incomplete_link_extraction(tmp_path, source, trunc
     assert "source" not in result
 
 
+def test_read_message_keeps_complete_links_from_truncated_mime_with_small_body_budget(tmp_path):
+    class SourceMail(FixtureMail):
+        def call(self, operation, args):
+            return {"body": "x" * args["max_chars"], "source_truncated": True,
+                    "source": 'Content-Type: text/html\n\n<a href="https://example.org/receipt">Receipt</a>'
+                              '<a href="https://example.org/cut">unfinished'}
+
+    result = call(create_server(bridge=SourceMail(), state_dir=tmp_path), "read_message",
+                  {"ref": REF, "max_chars": 1500})
+    assert result["links"] == [{"url": "https://example.org/receipt", "text": "Receipt"}]
+    assert result["links_truncated"] is True
+
+
+@pytest.mark.parametrize("remainder", range(4))
+def test_read_message_keeps_links_before_each_base64_cut_boundary(tmp_path, remainder):
+    import base64
+
+    html = b'<a href="https://example.org/receipt">Receipt</a>' + b'x' * 1000
+    prefix = base64.b64encode(html).decode()[:400 + remainder]
+
+    class SourceMail(FixtureMail):
+        def call(self, operation, args):
+            return {"source": 'Content-Type: text/html; charset=utf-8\n'
+                              'Content-Transfer-Encoding: base64\n\n' + prefix,
+                    "source_truncated": True}
+
+    result = call(create_server(bridge=SourceMail(), state_dir=tmp_path), "read_message",
+                  {"ref": REF, "max_chars": 1500})
+    assert result["links"] == [{"url": "https://example.org/receipt", "text": "Receipt"}]
+    assert result["links_truncated"] is True
+
+
 def test_read_message_bounds_links_and_ignores_html_attachments(tmp_path):
     from email.message import EmailMessage
 

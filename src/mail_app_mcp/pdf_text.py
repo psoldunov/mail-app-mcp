@@ -30,6 +30,8 @@ def extract_pdf(path: Path) -> dict:
     length = 0
     for page in reader.pages[:MAX_PAGES]:
         text = page.extract_text() or ""
+        if "\x00" in text:
+            return {"error": "PDF text contains unmapped characters; reliable extraction is unavailable"}
         pieces = (*pieces, text[:MAX_TEXT - length])
         length += len(text)
         if length >= MAX_TEXT:
