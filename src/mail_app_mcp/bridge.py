@@ -32,6 +32,7 @@ class BridgeError(RuntimeError):
     def __init__(self, message: str, *, operation: str | None = None,
                  apple_script_error_number: int | float | None = None):
         self.operation = operation
+        self.detail = message  # Undecorated, so a re-raise can extend it without repeating the prefix and suffixes.
         # Only an uncertain write can have side effects; every other failure left Mail unchanged.
         self.retry_safe = not isinstance(self, OutcomeUnknown)
         self.apple_script_error_number = apple_script_error_number

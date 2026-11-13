@@ -101,7 +101,7 @@ def perform_write(bridge, directory: Path, operation: str, arguments: dict) -> d
         try:
             result = bridge.call(operation, arguments)
         except OutcomeUnknown as exc:
-            raise OutcomeUnknown(f"{exc} {recovery}", operation=exc.operation,
+            raise OutcomeUnknown(f"{exc.detail} {recovery}", operation=exc.operation,
                                  apple_script_error_number=exc.apple_script_error_number) from exc
         except Exception:
             # Validation failures from the fixed script have no side effects.

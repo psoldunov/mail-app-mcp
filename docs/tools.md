@@ -82,17 +82,17 @@ Before loading a body for `search_body: true`, the bridge requires Mail's report
 {"from": "isabel", "sort": "newest", "limit": 1}
 ```
 
-Searches all accounts and mailboxes visible to Mail, including On My Mac, Sent, Junk, and Trash. Mail evaluates the literal sender substring in `from`; this is not an IMAP/provider search. No bodies are fetched. An empty `from` matches all messages. Use the existing `list_messages` tool for subject/body searches.
+Searches all accounts and mailboxes visible to Mail, including On My Mac, Sent, Junk, and Trash. The server reads every mailbox's sender, ID, and date fields from Mail in bulk and matches `from` as a case-insensitive literal substring of the sender; this is not an IMAP/provider search. No bodies are fetched. An empty `from` matches all messages. Use the existing `list_messages` tool for subject/body searches.
 
 | Argument | Default | Meaning |
 | --- | --- | --- |
-| `from` | `""` | Literal sender substring, up to 1,000 characters, using Mail's matching semantics. |
+| `from` | `""` | Case-insensitive literal sender substring, up to 1,000 characters. |
 | `sort` | `"newest"` | `newest` or `oldest`, by received date. |
 | `limit` | `50` | Maximum messages returned, from 1 to 100. |
 | `account_id` | `null` | Restrict to one account, including `__local__`. |
 | `mailbox` | `null` | Exact mailbox path; requires `account_id`. |
 
-All matching IDs and received dates are considered before applying `limit`. Repeated label views of the same account and Mail ID are deduplicated. Equal timestamps are ordered by account ID and numeric Mail ID. Returned message fields match `list_messages`, but `ref.mailbox` is the mailbox that stores the message, which for Gmail is often All Mail.
+All matching IDs and received dates are considered before applying `limit`. Repeated label views of the same account and Mail ID are deduplicated. Equal timestamps are ordered by account ID and numeric Mail ID. Returned message fields match `list_messages`. When Gmail lists one message under several labels, `ref.mailbox` is `INBOX` if that is one of them, then any other label, and All Mail last. A mailbox that Mail counts as empty but refuses to read in bulk, such as Gmail's Notes, is treated as empty.
 
 `complete: true` means the selected scope was fully enumerated during the call; `has_more: true` means the limit omitted additional matches. Unlike `list_messages`, this tool does not return a partial scan or continuation. It fails if a mailbox fails, metadata changes are detected, or the search exceeds 1,000 mailboxes, 20,000 matching header occurrences, or a 20-second work budget. Narrow the scope or sender filter and retry. On a store with several large accounts, an unscoped search can exceed the budget even with a sender filter; pass `account_id`, and `mailbox` if needed. One Apple event can exceed the work budget; the bridge's 45-second timeout remains the outer limit.
 
@@ -164,7 +164,9 @@ Addresses must be 3 to 320 characters, with a local part and domain separated by
 
 Returns `status: "draft"`, `account_id`, `sender`, and `ref`, the reference of the copy Mail saved in Drafts. Pass that `ref` to `read_message` to check the draft or to `show_message` to open it. The sender must belong to exactly one account; an address advertised by multiple accounts is rejected as ambiguous. It saves a new draft and never sends. Mail may sync the draft to its provider, and it can later re-save the draft under new IDs; if the `ref` goes stale, list the Drafts mailbox again. This server cannot edit a draft. A repeated creation call creates another draft; do not retry an uncertain call automatically.
 
-The server composes every draft in a hidden window, saves it, then waits up to 30 seconds for the saved copy to appear in Drafts with the requested subject and body. If no copy appears in time, the call still succeeds, with `ref: null` and a `warning`; it opens no window, and you should find the draft in Drafts instead of retrying. If a copy appears but never contains the body, the call fails as an uncertain write.
+The server composes every draft in a hidden window, saves it, then waits up to 30 seconds for the saved copy to appear in Drafts with the requested subject and body. If no copy appears in time, the call still succeeds, with `ref: null` and a `warning`; it opens no window, and you should find the draft in Drafts instead of retrying. If a copy appears but never contains the body, the call fails as an uncertain write. If Mail cannot open the saved copy for `open_window`, the call succeeds with the `ref` and a `warning`; open it with `show_message`.
+
+Mail keeps every hidden compose window until it quits, and scripting cannot close one. Their drafts are already saved, but Mail can autosave a hidden window into Drafts on its own, so quit Mail now and then to clear them.
 
 ## reply_draft
 

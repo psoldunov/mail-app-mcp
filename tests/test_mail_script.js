@@ -19,6 +19,8 @@ function collection(items) {
       : item[key]() === criteria[key])));
   value.slice = (start, end) => collection(items.slice(start, end + 1));
   BULK.forEach((key) => { value[key] = () => items.map((item) => item[key]()); });
+  // A function's own `name` is read-only, so define the bulk getter instead of assigning it.
+  Object.defineProperty(value, 'name', { value: () => items.map((item) => item.name()) });
   value.byId = (id) => items.find((item) => item.id() === id);
   value.push = (item) => { items.push(item); };
   return value;
@@ -381,6 +383,36 @@ test('a saved copy that is slow to appear is a warned success, not an uncertain 
   assert.equal(saved.length, 1);
   assert.equal(result.ref, null);
   assert.match(result.warning, /did not appear.*no window was opened.*Do not retry/);
+});
+
+test('a saved draft that Mail cannot open is a warned success, not an uncertain write', () => {
+  const { mail, ref } = fixture();
+  const { savedRef } = composing(mail);
+  mail.open = () => { throw Object.assign(new Error("Can't get object."), { errorNumber: -1728 }); };
+  mail.activate = () => assert.fail('Mail must not come forward when nothing opened');
+  mail.reply = () => mail.OutgoingMessage({ subject: 'Re: Hello', content: '', sender: 'me@example.com' });
+  const result = dispatch(mail, 'reply_draft', { ref, sender: 'me@example.com', body: 'Reply', reply_all: true,
+    open_window: true });
+  assert.deepEqual(result.ref, savedRef(901));
+  assert.match(result.warning, /could not open it: Can't get object.*show_message/);
+});
+
+test('a copy Mail deletes while it is being checked is skipped, not reported as a failure', () => {
+  const { mail, draftbox } = fixture();
+  const { savedRef } = composing(mail);
+  const save = mail.save;
+  mail.save = (draft) => {
+    save(draft);
+    const vanished = new Proxy(scripting({ id: 950 }), { get(target, key) {
+      if (key === 'id') return target.id;
+      return () => { throw Object.assign(new Error("Can't get object."), { errorNumber: -1728 }); };
+    } });
+    draftbox.messages = collection(draftbox.messages().concat([vanished]));
+  };
+  const result = dispatch(mail, 'create_draft', { account_id: 'a1', sender: 'me@example.com', to: ['you@example.com'],
+    cc: [], bcc: [], subject: 'Race', body: 'Body' });
+  assert.deepEqual(result.ref, savedRef(901));
+  assert.equal(result.warning, undefined);
 });
 
 test('a saved copy without the requested body reports an unknown outcome', (t) => {
@@ -775,7 +807,8 @@ test('global search bounds work and rejects incomplete or changing metadata', ()
   let reads = 0;
   inbox.messages.id = () => ++reads === 1 ? [1] : [2];
   assert.throws(() => dispatch(mail, 'search_messages', args), /Mailbox changed/);
-  inbox.messages = { length: 20001, id: () => assert.fail('Oversize metadata fetched') };
+  const many = Array.from({ length: 20001 }, (_, index) => index + 1);
+  inbox.messages = { id: () => many, dateReceived: () => many.map(() => new Date('2026-01-01')) };
   assert.throws(() => dispatch(mail, 'search_messages', args), /20000/);
   for (const bad of [{ sort: 'random' }, { limit: 101 }, { from: 4 }, { account_id: null, mailbox: ['Inbox'] }]) {
     assert.throws(() => dispatch({}, 'search_messages', { ...args, ...bad }), /Invalid/);
@@ -795,27 +828,44 @@ test('global search never returns partial latest when an account fails or time e
   assert.throws(() => dispatch(mail, 'search_messages', args), /latest match not established/);
 });
 
-test('sender filter stays in Mail and only selected summaries fetch subjects', () => {
+test('sender filter reads whole-mailbox headers and hydrates only selected summaries', () => {
   const { mail, inbox, messages } = fixture(1000);
-  messages[999].sender = 'Isabel';
-  messages.forEach((message, index) => {
-    message.content = () => assert.fail('Search fetched body');
-    if (index !== 999) message.subject = () => assert.fail('Nonmatch summary fetched');
-  });
-  let predicate;
-  inbox.messages.whose = (criteria) => {
-    if (criteria.sender) {
-      predicate = criteria;
-      return collection([messages[999]]);
-    }
-    return collection(messages.filter((m) => m.id() === criteria.id));
-  };
-  const result = dispatch(mail, 'search_messages', { from: 'Isabel', sort: 'newest', limit: 1,
+  messages[999].sender = 'Isabel <isabel@example.com>';
+  inbox.messages = collection(messages.map((message, index) => new Proxy(message, { get(target, key) {
+    if (key === 'content' || (index !== 999 && key === 'subject')) assert.fail('Nonmatch body or summary fetched');
+    return target[key];
+  } })));
+  inbox.messages.whose = () => assert.fail('A whose clause rescans the mailbox for every property read');
+  inbox.messages.subject = () => assert.fail('Filtering needs no subjects');
+  const result = dispatch(mail, 'search_messages', { from: 'isabel', sort: 'newest', limit: 1,
     account_id: 'a1', mailbox: null });
-  assert.deepEqual(predicate, { sender: { _contains: 'Isabel' } });
   assert.equal(result.matched_candidates, 1);
   assert.equal(result.messages[0].ref.message_id, 1000);
   assert.ok(result.timing_ms.total >= 0);
+});
+
+test('an empty mailbox that rejects bulk reads counts as empty; a nonempty one still fails', () => {
+  const { mail, archive } = fixture();
+  const notes = (length) => ({ length, id: () => { throw Object.assign(new Error("Can't get object."), { errorNumber: -1728 }); } });
+  archive.messages = notes(0);
+  assert.equal(dispatch(mail, 'search_messages', { from: '', sort: 'newest', limit: 5, account_id: 'a1', mailbox: null })
+    .messages.length, 1);
+  assert.deepEqual(dispatch(mail, 'list_messages', { account_id: 'a1', mailbox: ['Archive'], offset: 0, limit: 5,
+    query: '', search_body: false }), { messages: [], next_offset: null, complete: true, scanned: 0, stopped: 'end' });
+  archive.messages = notes(3);
+  assert.throws(() => dispatch(mail, 'search_messages', { from: '', sort: 'newest', limit: 5, account_id: 'a1',
+    mailbox: null }), /Can't get object/);
+});
+
+test('search refs prefer the INBOX label over the All Mail copy of the same message', () => {
+  const { mail, account, inbox, archive, messages } = fixture();
+  archive.name = 'All Mail';
+  messages[0].mailbox = archive;
+  archive.messages = collection(messages);
+  account.mailboxes = collection([archive, inbox]);
+  const result = dispatch(mail, 'search_messages', { from: '', sort: 'newest', limit: 5, account_id: 'a1', mailbox: null });
+  assert.deepEqual(result.messages.map((m) => m.ref.mailbox), [['Inbox']]);
+  assert.equal(dispatch(mail, 'read_message', { ref: result.messages[0].ref, max_chars: 4 }).body, 'Body');
 });
 
 test('global search hydrates one summary for limit one despite many matches and duplicate labels', () => {
@@ -849,9 +899,10 @@ test('global search rejects conflicting label dates and a result that changes af
   archive.messages = collection([scripting({ id: 1, dateReceived: new Date('2020-01-01') })]);
   assert.throws(() => dispatch(mail, 'search_messages', args), /Duplicate message dates changed/);
   archive.messages = collection([]);
-  inbox.messages.whose = () => {
+  const byId = inbox.messages.byId;
+  inbox.messages.byId = (id) => {
     messages[0].dateReceived = new Date('2020-01-01');
-    return collection(messages);
+    return byId(id);
   };
   assert.throws(() => dispatch(mail, 'search_messages', args), /Message changed/);
 });

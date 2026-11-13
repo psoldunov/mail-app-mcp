@@ -72,6 +72,33 @@ def test_valid_pdf_extracts_in_bounded_child_process(tmp_path):
     assert extract_pdf(fixture) == {"text": "", "pages": 1, "truncated": False}
 
 
+def test_pdf_child_gets_the_server_import_path(tmp_path, monkeypatch):
+    # Under Nix the bare interpreter cannot import this package or pypdf; only the server's sys.path can.
+    import sys
+    from io import BytesIO
+    from pypdf import PdfWriter
+
+    output = BytesIO()
+    writer = PdfWriter()
+    writer.add_blank_page(width=100, height=100)
+    writer.write(output)
+    monkeypatch.setattr(sys, "executable", sys._base_executable)
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    monkeypatch.delenv("NIX_PYTHONPATH", raising=False)
+    result = read_attachment_content(AttachmentMail(output.getvalue(), "application/pdf"), tmp_path, REF, "att")
+    assert result["pages"] == 1
+
+
+def test_pdf_child_failure_reports_its_cause(tmp_path, monkeypatch):
+    import sys
+
+    monkeypatch.setattr(sys, "path", [str(tmp_path / "nothing-here")])
+    monkeypatch.delenv("NIX_PYTHONPATH", raising=False)
+    monkeypatch.setattr(sys, "executable", sys._base_executable)
+    with pytest.raises(ValueError, match="No module named"):
+        read_attachment_content(AttachmentMail(b"%PDF-1.4", "application/pdf"), tmp_path, REF, "att")
+
+
 def test_encrypted_pdf_is_explicitly_unsupported(tmp_path):
     from pypdf import PdfWriter
     from mail_app_mcp.pdf_text import extract_pdf
