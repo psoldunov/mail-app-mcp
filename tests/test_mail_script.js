@@ -45,6 +45,7 @@ function fixture(count = 1) {
     subject: i === 200 ? 'Needle' : 'Hello [literal]', sender: 'other@example.com',
     dateReceived: new Date('2026-01-02T03:04:05Z'), dateSent: new Date('2026-01-02T03:04:05Z'),
     readStatus: false, flaggedStatus: false, content: 'Body with secret', messageSize: 1000,
+    source: 'Content-Type: text/html\n\n<a href="https://example.com">link</a>',
     allHeaders: 'To: me@example.com\nCc: Me Too <self@example.com>\n',
   }), { toRecipients: collection([scripting({ address: 'me@example.com' })]),
     ccRecipients: collection([]), mailAttachments: collection([]) }));
@@ -73,6 +74,52 @@ test('lists public account fields plus the local account', () => {
     { account_id: 'a1', name: 'Work', email_addresses: ['me@example.com'] },
     { account_id: '__local__', name: 'On My Mac', email_addresses: [] },
   ] });
+});
+
+test('trash discovery resolves the unique account mailbox path from the special tree', () => {
+  const { mail, account, archive, inbox } = fixture();
+  const group = scripting({ name: '[Provider]', account, container: account });
+  archive.container = group;
+  archive.name = 'Localized bin';
+  const other = Object.assign(scripting({ name: 'Trash', account: scripting({ id: 'a2' }), container: null }),
+    { mailboxes: collection([]) });
+  const root = Object.assign(scripting({ name: 'All Trash', account: null, container: null }),
+    { mailboxes: collection([other, archive]) });
+  mail.trashMailbox = () => root;
+  assert.deepEqual(dispatch(mail, 'trash_destination', { account_id: 'a1' }),
+    { account_id: 'a1', destination: ['[Provider]', 'Localized bin'] });
+  root.mailboxes = collection([other]);
+  assert.throws(() => dispatch(mail, 'trash_destination', { account_id: 'a1' }), /Trash.*missing or ambiguous/);
+  root.mailboxes = collection([archive, inbox]);
+  assert.throws(() => dispatch(mail, 'trash_destination', { account_id: 'a1' }), /Trash.*missing or ambiguous/);
+  root.mailboxes = collection([root]);
+  assert.throws(() => dispatch(mail, 'trash_destination', { account_id: 'a1' }), /hierarchy too/);
+});
+
+test('trash discovery ignores ordinary descendants of the account Trash', () => {
+  const { mail, account, archive } = fixture();
+  const child = Object.assign(scripting({ name: 'Old', account, container: archive }),
+    { mailboxes: collection([]) });
+  archive.mailboxes = collection([child]);
+  account.mailboxes = collection([archive, child]);
+  mail.trashMailbox = () => Object.assign(scripting({ name: 'All Trash', account: null, container: null }),
+    { mailboxes: collection([archive]) });
+  assert.deepEqual(dispatch(mail, 'trash_destination', { account_id: 'a1' }),
+    { account_id: 'a1', destination: ['Archive'] });
+});
+
+test('trash discovery cannot mistake the virtual root for a local folder with the same name', () => {
+  const { mail } = fixture();
+  const local = Object.assign(scripting({ name: 'Trash', account: null, container: null }),
+    { mailboxes: collection([]) });
+  const root = Object.assign(scripting({ name: 'Trash', account: null, container: null }),
+    { mailboxes: collection([]) });
+  mail.mailboxes = collection([local]);
+  mail.trashMailbox = () => root;
+  assert.throws(() => dispatch(mail, 'trash_destination', { account_id: '__local__' }), /Trash.*missing or ambiguous/);
+  root.mailboxes = collection([local]);
+  assert.deepEqual(dispatch(mail, 'trash_destination', { account_id: '__local__' }),
+    { account_id: '__local__', destination: ['Trash'] });
 });
 
 test('lists and searches flat mailboxes with an account as their terminal container', () => {
@@ -223,6 +270,41 @@ test('reads bounded body only after exact reference validation', () => {
   assert.equal(messages[0].readStatus(), false);
 });
 
+test('read returns complete small MIME sources but omits oversized sources explicitly', () => {
+  const { mail, ref, messages } = fixture();
+  const args = { ref, max_chars: 4 };
+  assert.equal(dispatch(mail, 'read_message', args).source, messages[0].source());
+  assert.equal(dispatch(mail, 'read_message', args).source_truncated, false);
+  messages[0].source = 'x'.repeat(100001);
+  const large = dispatch(mail, 'read_message', args);
+  assert.equal(large.source, undefined);
+  assert.equal(large.source_truncated, true);
+  assert.equal(large.body, 'Body');
+  messages[0].source = 'x'.repeat(100000);
+  assert.equal(dispatch(mail, 'read_message', args).source.length, 100000);
+});
+
+test('unavailable MIME source preserves plain-text reads and unexpected source errors propagate', () => {
+  for (const number of [-10000, -1743, undefined]) {
+    const { mail, ref, inbox, messages } = fixture();
+    inbox.messages = collection([new Proxy(messages[0], { get(target, key) {
+      if (key === 'source') return () => {
+        if (number === undefined) return undefined;
+        throw Object.assign(new Error('Source unavailable'), { errorNumber: number });
+      };
+      return target[key];
+    } })]);
+    if (number === -1743) {
+      assert.throws(() => dispatch(mail, 'read_message', { ref, max_chars: 4 }), /Source unavailable/);
+    } else {
+      const result = dispatch(mail, 'read_message', { ref, max_chars: 4 });
+      assert.equal(result.body, 'Body');
+      assert.equal(result.source, undefined);
+      assert.equal(result.source_truncated, true);
+    }
+  }
+});
+
 test('a failing header getter keeps reads working with Mail recipients only', () => {
   for (const [number, works] of [[-10000, true], [-1743, false]]) {
     const { mail, ref, inbox, messages } = fixture();
@@ -261,6 +343,40 @@ test('status updates verify identity and reject Outbox source before writing', (
   assert.throws(() => dispatch(mail, 'set_message_status', {
     ref: { ...ref, mailbox: ['Localized outgoing'] }, read: false, flagged: null }), /unsafe|outbox/i);
   assert.equal(messages[0].readStatus(), true);
+});
+
+test('status verification reacquires the message until delayed changes settle', (t) => {
+  const { mail, ref, inbox, messages } = fixture();
+  const original = messages[0];
+  let elapsed = 0;
+  t.mock.method(global.$.NSThread, 'sleepForTimeInterval', (seconds) => { elapsed += seconds; });
+  inbox.messages.whose = () => collection([new Proxy(original, {
+    get(target, key) {
+      if (key === 'readStatus') return () => elapsed < 1 ? true : false;
+      if (key === 'flaggedStatus') return () => elapsed >= 1;
+      return target[key];
+    },
+    set() { return true; },
+  })]);
+  assert.deepEqual(dispatch(mail, 'set_message_status', { ref, read: false, flagged: true }),
+    { ref, read: false, flagged: true });
+  assert.ok(elapsed >= 2, 'A transient matching poll must not confirm success');
+});
+
+test('status verification rejects cached success when freshly resolved state reverts', () => {
+  const { mail, ref, inbox, messages } = fixture();
+  const original = messages[0];
+  let resolutions = 0;
+  inbox.messages.whose = () => collection([++resolutions === 1 ? original : new Proxy(original, {
+    get(target, key) {
+      if (key === 'readStatus') return () => true;
+      if (key === 'flaggedStatus') return () => false;
+      return target[key];
+    },
+  })]);
+  assert.throws(() => dispatch(mail, 'set_message_status', { ref, read: false, flagged: true }),
+    /Outcome unknown:.*Status verification failed/);
+  assert.ok(resolutions <= 12, 'Verification must stop after bounded polling');
 });
 
 test('moves within account and rejects resolved special destinations and stale source', () => {
@@ -307,7 +423,7 @@ function composing(mail, { copy = true } = {}) {
   const copies = new Map();
   let nextId = 900;
   mail.outgoingMessages = collection(drafts);
-  mail.OutgoingMessage = (properties) => Object.assign(scripting({ id: 42, subject: '', visible: true, ...properties }), {
+  mail.OutgoingMessage = (properties) => Object.assign(scripting({ id: 42, subject: '', visible: true, messageSignature: 'Default signature', ...properties }), {
     toRecipients: collection([]), ccRecipients: collection([]), bccRecipients: collection([]),
   });
   mail.ToRecipient = mail.CcRecipient = mail.BccRecipient = (properties) => scripting(properties);
@@ -319,7 +435,7 @@ function composing(mail, { copy = true } = {}) {
     copies.set(draft, nextId);
     draftbox.messages = collection(draftbox.messages().filter((message) => message.id() !== previous)
       .concat([scripting({ id: nextId, messageId: `<draft-${nextId}@example.com>`, mailbox: draftbox,
-        subject: draft.subject(), content: `\n${draft.content()} \n\n--\nSignature` })]));
+        subject: draft.subject(), content: draft.messageSignature() === null ? draft.content() : `\n${draft.content()} \n\n--\nSignature` })]));
   };
   mail.send = () => assert.fail('must never send');
   mail.activate = () => assert.fail('must not activate without an explicit window request');
@@ -549,8 +665,23 @@ test('native reply hides its window before writing the body, quotes the original
   assert.equal(replies, 0);
   assert.deepEqual(dispatch(mail, 'reply_draft', args),
     { status: 'draft', account_id: 'a1', sender: 'me@example.com', ref: savedRef(902) });
-  assert.deepEqual(events, [['visible', false], ['sender', 'me@example.com'], ['content', 'body']]);
+  assert.deepEqual(events, [['visible', false], ['sender', 'me@example.com'], ['messageSignature', null], ['content', 'body']]);
   assert.match(saved[0].content(), /^My reply\n\nOn .+, other@example.com wrote:\n\n> Line one\n> Line two $/);
+});
+
+test('new and reply drafts disable signatures and empty replies add no leading blank line', () => {
+  const { mail, ref, draftbox } = fixture();
+  const { saved } = composing(mail);
+  dispatch(mail, 'create_draft', { account_id: 'a1', sender: 'me@example.com', to: ['you@example.com'],
+    cc: [], bcc: [], subject: 'No signature', body: 'Hello' });
+  assert.equal(saved[0].messageSignature(), null);
+  assert.equal(draftbox.messages()[0].content(), 'Hello');
+  mail.reply = () => mail.OutgoingMessage({ subject: 'Re: Hello', content: '', sender: 'me@example.com' });
+  dispatch(mail, 'reply_draft', { ref, sender: 'me@example.com', body: '', reply_all: false });
+  assert.equal(saved[1].messageSignature(), null);
+  assert.match(draftbox.messages()[1].content(), /^On .+ wrote:/);
+  dispatch(mail, 'reply_draft', { ref, sender: 'me@example.com', body: '\nIntentional spacing', reply_all: false });
+  assert.match(saved[2].content(), /^\nIntentional spacing\n\nOn /);
 });
 
 test('reply quotes are bounded for very long originals', () => {
@@ -718,6 +849,7 @@ test('invalid requests fail before accessing Mail', () => {
   for (const [operation, args] of [
     ['list_messages', { account_id: 'a1', mailbox: ['Inbox'], offset: -1, limit: 1, query: '', search_body: false }],
     ['read_message', { ref, max_chars: 100001 }],
+    ['trash_destination', { account_id: '' }],
     ['move_message', { ref, destination: [] }],
     ['set_message_status', { ref, read: null, flagged: null }],
     ['set_message_status', { ref, read: 'true' }],

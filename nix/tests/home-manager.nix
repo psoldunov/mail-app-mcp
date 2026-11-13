@@ -27,6 +27,9 @@ let
   }).config;
   server = enabled.programs.mcp.servers.mail-app;
   defaults = (evaluate { services.mail-app-mcp.enable = true; }).config;
+  unrestrictedAccount = (evaluate {
+    services.mail-app-mcp = { enable = true; settings.accounts.work = { }; };
+  }).config;
   overridePackage = pkgs.writeShellScriptBin "mail-app-mcp" "exit 0";
   overridden = (evaluate {
     services.mail-app-mcp = { enable = true; package = overridePackage; };
@@ -57,5 +60,7 @@ pkgs.runCommand "mail-app-mcp-home-manager" {
   jq -e --arg command '${server.command}' '.mcpServers["mail-app"].command == $command' \
     ${enabled.xdg.configFile."mcp/mcp.json".source}
   jq -e '. == {accounts: {}}' ${builtins.elemAt defaults.programs.mcp.servers.mail-app.args 1}
+  jq -e '.accounts.work == {trash_mailbox: null, allowed_destinations: null}' \
+    ${builtins.elemAt unrestrictedAccount.programs.mcp.servers.mail-app.args 1}
   touch "$out"
 ''

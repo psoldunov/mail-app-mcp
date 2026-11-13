@@ -12,18 +12,18 @@ in {
     package = lib.mkPackageOption self.packages.${pkgs.stdenv.hostPlatform.system} "mail-app-mcp" { };
     settings.accounts = mkOption {
       default = { };
-      description = "Explicit mailbox move permissions keyed by Apple Mail account ID.";
+      description = "Optional mailbox move restrictions keyed by Apple Mail account ID.";
       type = types.attrsOf (types.submodule {
         options = {
           trash_mailbox = mkOption {
             type = types.nullOr mailbox;
             default = null;
-            description = "Trash mailbox path segments; null disables trash operations.";
+            description = "Trash mailbox path segments; null discovers Mail's account Trash.";
           };
           allowed_destinations = mkOption {
-            type = types.listOf mailbox;
-            default = [ ];
-            description = "Mailbox paths to which messages may be moved within this account.";
+            type = types.nullOr (types.listOf mailbox);
+            default = null;
+            description = "Null allows ordinary same-account destinations; a list restricts moves to these paths plus explicit Trash.";
           };
         };
       });

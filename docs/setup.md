@@ -17,14 +17,22 @@ Use the pinned input example in [README.md](../README.md). The exported module i
 | `services.mail-app-mcp.enable` | `false` | Install the package and register the stdio server. macOS only. |
 | `services.mail-app-mcp.package` | Flake package for your platform | Override the installed server package. |
 | `services.mail-app-mcp.settings.accounts` | `{}` | Map exact Mail account IDs to move policy. |
-| `settings.accounts.<id>.trash_mailbox` | `null` | Explicit Trash path as a list of segments. |
-| `settings.accounts.<id>.allowed_destinations` | `[]` | Lists of mailbox path segments permitted for ordinary moves. |
+| `settings.accounts.<id>.trash_mailbox` | `null` | Discover Mail's actual account Trash, or override it with an explicit path. |
+| `settings.accounts.<id>.allowed_destinations` | `null` | Permit ordinary same-account destinations, or restrict them with an explicit list of paths. |
 
 The last two options are under `services.mail-app-mcp`. Each mailbox path has 1 to 20 segments; the server accepts at most 100 ordinary destinations per account. The module enables `programs.mcp`, adds the `mail-app` server, and generates a JSON file passed with `--config`. Home Manager writes the common client configuration to `$XDG_CONFIG_HOME/mcp/mcp.json`, normally `~/.config/mcp/mcp.json`. Check whether your client imports that format; otherwise copy the generated command and arguments into its settings.
 
 The generated policy resides in the Nix store. Do not put secrets in it. Account IDs and mailbox names are configuration metadata and may be readable by other local users through the store. No credentials belong in this configuration.
 
-## Discover each account before enabling moves
+## Policy defaults and migration
+
+Moves do not require a policy file or account entry. Omitting `allowed_destinations` or setting it to `null` permits ordinary destinations in the source account. An explicit list restricts moves to those paths plus an explicit `trash_mailbox` override. `allowed_destinations: []` permits only that override, if one is configured; with no override, it denies every move, including Trash.
+
+Omitted or `null` `trash_mailbox` makes the server discover Mail's actual Trash for the source account. The discovered path must pass the destination policy. Discovery fails if Mail exposes no matching Trash or more than one; it never guesses from folder names. An explicit `trash_mailbox` bypasses discovery and authorizes that path even when it is absent from `allowed_destinations`. Sending, Drafts, and Sent destination guards apply in every case.
+
+When upgrading, keep an old explicit `[]` if you want its restrictions. Removing it or replacing it with `null` permits ordinary same-account moves. Accounts missing from the policy now permit moves, so add an entry with `allowed_destinations: []` and no Trash override for each account whose moves you want to block. Home Manager uses the same defaults. Restart the server after policy changes.
+
+## Discover each account before configuring restrictions
 
 Use tool calls from your MCP client. The JSON below is each tool's argument object.
 
@@ -44,7 +52,7 @@ Use tool calls from your MCP client. The JSON below is each tool's argument obje
 
    Copy returned `path` arrays. `["Projects", "2026"]` means a child mailbox; `["Projects/2026"]` means one mailbox whose name contains a slash. Never split or join paths yourself.
 
-3. Confirm the account's actual Trash folder in Mail, then add independent policies:
+3. To restrict moves, add independent policies. Confirm any explicit Trash override in Mail:
 
    ```nix
    services.mail-app-mcp.settings.accounts = {
@@ -59,9 +67,9 @@ Use tool calls from your MCP client. The JSON below is each tool's argument obje
    };
    ```
 
-   Replace every ID and path. The owner is responsible for identifying the correct Trash and ordinary destinations. A configured Trash path also permits `move_message` to that path. It does not need to appear again in `allowed_destinations`.
+   Replace every ID and path. The owner is responsible for identifying the correct Trash override and ordinary destinations. A configured Trash path also permits `move_message` to that path. It does not need to appear again in `allowed_destinations`. For automatic Trash discovery, omit the override and include the actual Trash path in the restricted list.
 
-4. Apply the Home Manager change and restart the MCP server in your client. Test the policy with disposable messages first. Restore operations also require the destination, such as Inbox, to be allowlisted, or you can restore manually in Mail.
+4. Apply the Home Manager change and restart the MCP server in your client. Test the policy with disposable messages first. A restricted policy must also allow any restore destination, such as Inbox, or you can restore manually in Mail.
 
 Read discovery is not restricted by `settings.accounts`. Draft creation, replies, and status changes do not require an account policy entry. Use client-side tool permissions if you want to withhold these operations from an agent.
 
@@ -105,6 +113,8 @@ Without Home Manager, create a policy file owned by you:
 }
 ```
 
+In this policy, the work account allows the two listed destinations and its explicit Trash override. The personal account allows only `Receipts`; its `null` Trash setting triggers discovery, but Trash moves will be denied unless the discovered path is also allowed. Use `allowed_destinations: null` to allow ordinary same-account destinations.
+
 Point your client's stdio-server settings at the installed executable. Clients using the common `mcpServers` format accept this shape:
 
 ```json
@@ -118,7 +128,7 @@ Point your client's stdio-server settings at the installed executable. Clients u
 }
 ```
 
-Use actual absolute paths; do not rely on shell expansion of `~`. Starting the executable directly waits for MCP input on stdin and is not an interactive mail CLI. `mail-app-mcp --help` displays its arguments without touching Mail. Omit `--config` to disable moves and Trash, while retaining reads, drafts, and status changes. Configuration is read at startup, so restart after edits.
+Use actual absolute paths; do not rely on shell expansion of `~`. Starting the executable directly waits for MCP input on stdin and is not an interactive mail CLI. `mail-app-mcp --help` displays its arguments without touching Mail. Omitting `--config` permits ordinary same-account moves and uses Mail's discovered account Trash. Configuration is read at startup, so restart after edits.
 
 ## Troubleshooting
 
@@ -128,7 +138,8 @@ Use actual absolute paths; do not rely on shell expansion of `~`. Starting the e
 | Automation permission denied | Check the responsible launcher under macOS Automation settings. Inspect Mail before repeating any attempted write. |
 | `programs.mcp` option is missing | Use a Home Manager revision that provides it, such as the pinned revision in the README. |
 | Server is missing in the client | Check that the client consumes Home Manager's configuration or copy the generated command/args into its own settings. |
-| Destination or Trash is not configured | Denied moves list that account's configured destinations. Rediscover mailbox paths, update the owner-controlled policy, then restart the server. Sending mailbox restrictions still apply. |
+| Destination is not allowed | Check the account's explicit `allowed_destinations`, including an old `[]`. Add the exact path or use `null` to permit ordinary same-account destinations, then restart. An explicit Trash override is also allowed. Sending, Drafts, and Sent guards still apply. |
+| Trash discovery is missing or ambiguous | Confirm the account's actual Trash in Mail and configure its exact path as `trash_mailbox`, then restart. The server does not guess a folder name. |
 | Missing, stale, or ambiguous reference | List the source mailbox again and use the newly returned `ref`. Draft autosave can change both IDs; moves and external changes can also invalidate references. |
 | Cannot reply to a saved draft | Select a received message, or use `create_draft` for a new standalone draft. Saved drafts cannot be reply sources. |
 | A draft call returned `ref: null` with a warning | Mail saved the draft, but its copy did not reach Drafts within 30 seconds. List the Drafts mailbox to find it; do not create another draft. |

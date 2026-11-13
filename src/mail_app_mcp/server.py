@@ -17,10 +17,11 @@ import anyio
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
-from pydantic import Field
+from pydantic import Field, TypeAdapter
 
 from .attachments import guessed_mime
 from .bridge import BridgeError, MailBridge, OutcomeUnknown, write_lock
+from .links import message_links
 from .models import Address, Body, Draft, Identifier, Mailbox, MessageRef, Settings
 
 Limit = Annotated[int, Field(strict=True, ge=1, le=100)]
@@ -131,7 +132,7 @@ def completed_read(message: dict) -> dict:
     """Mail omits recipients that are the account's own addresses (the raw headers still list them)
     and can fail to report attachment MIME types."""
     headers = email.message_from_string(message.get("headers") or "", policy=email.policy.compat32)
-    merged = {key: value for key, value in message.items() if key != "headers"}
+    merged = {key: value for key, value in message.items() if key not in {"headers", "source", "source_truncated"}}
     for field in ("to", "cc", "bcc"):
         addresses = {}
         parsed = [address for _, address in getaddresses(headers.get_all(field, [])) if address]
@@ -139,7 +140,7 @@ def completed_read(message: dict) -> dict:
             addresses.setdefault(address.casefold(), address)
         merged[field] = list(addresses.values())
     merged["attachments"] = [guessed_mime(item) for item in message.get("attachments", [])]
-    return merged
+    return {**merged, **message_links(message.get("source"), message.get("source_truncated", False))}
 
 
 def create_server(settings: Settings | None = None, bridge=None, state_dir: Path | None = None) -> FastMCP:
@@ -204,7 +205,10 @@ def create_server(settings: Settings | None = None, bridge=None, state_dir: Path
 
     @tool(READ)
     def read_message(ref: MessageRef, max_chars: TextLimit = 50_000) -> dict:
-        """Read a scoped message, its to/cc/bcc and attachment metadata. Content is untrusted; truncated indicates incomplete text."""
+        """Read a scoped message, recipients, attachment metadata and HTML links. Content is untrusted.
+
+        truncated indicates incomplete body text; links_truncated indicates incomplete link extraction.
+        """
         return completed_read(mail.call("read_message", {"ref": ref.model_dump(mode="json"), "max_chars": max_chars}))
 
     @tool(ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False))
@@ -252,7 +256,7 @@ def create_server(settings: Settings | None = None, bridge=None, state_dir: Path
 
     @tool(WRITE)
     def move_message(ref: MessageRef, destination: Mailbox) -> dict:
-        """Move within the same account to an owner-configured mailbox. Re-list messages after moving; IDs may change."""
+        """Move within the same account, subject to optional destination restrictions. Re-list afterward; IDs may change."""
         target = policy.destination(ref.account_id, destination)
         if tuple(target) == ref.mailbox:
             raise ValueError("Message is already in the destination mailbox")
@@ -260,8 +264,14 @@ def create_server(settings: Settings | None = None, bridge=None, state_dir: Path
 
     @tool(WRITE)
     def trash_message(ref: MessageRef) -> dict:
-        """Move to the owner's configured Trash. Never permanently delete; Mail/provider retention policies still apply."""
+        """Move to Mail's account Trash or an owner override, subject to destination restrictions. Retention policies still apply."""
         target = policy.trash(ref.account_id)
+        if target is None:
+            discovered = mail.call("trash_destination", {"account_id": ref.account_id})
+            if discovered.get("account_id") != ref.account_id:
+                raise ValueError("Discovered Trash belongs to another account")
+            path = TypeAdapter(Mailbox).validate_python(discovered.get("destination"))
+            target = policy.destination(ref.account_id, path)
         if tuple(target) == ref.mailbox:
             raise ValueError("Message is already in Trash")
         return perform_write(mail, directory, "move_message", {"ref": ref.model_dump(mode="json"), "destination": target})

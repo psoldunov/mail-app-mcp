@@ -14,7 +14,7 @@ from .process import ProcessCommunicationError, run_bounded
 
 READ_OPERATIONS = frozenset({
     "list_accounts", "list_mailboxes", "list_messages", "read_message",
-    "search_messages", "save_attachment",
+    "search_messages", "save_attachment", "trash_destination",
 })
 # Opening a window cannot duplicate or lose mail, so its failures are never uncertain writes.
 UI_OPERATIONS = frozenset({"show_message"})

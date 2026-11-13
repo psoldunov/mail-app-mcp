@@ -9,10 +9,10 @@ def test_account_is_required_for_message_identity():
         MessageRef(mailbox=["Inbox"], message_id=1, header_message_id="a@example.org")
 
 
-def test_policy_defaults_to_no_mailbox_moves():
+def test_policy_defaults_to_allow_mailbox_moves():
     settings = Settings()
-    with pytest.raises(ValueError, match="configured"):
-        settings.destination("work", ["Trash"])
+    assert settings.destination("work", ["Archive"]) == ["Archive"]
+    assert settings.trash("work") is None
 
 
 def test_account_policy_cannot_authorize_another_account():
@@ -21,8 +21,21 @@ def test_account_policy_cannot_authorize_another_account():
     }}})
     assert settings.destination("work", ["Archive"]) == ["Archive"]
     assert settings.trash("work") == ["Deleted Messages"]
+    assert settings.destination("personal", ["Projects"]) == ["Projects"]
     with pytest.raises(ValueError, match="configured"):
-        settings.destination("personal", ["Archive"])
+        settings.destination("work", ["Projects"])
+
+
+@pytest.mark.parametrize("policy", [{}, {"allowed_destinations": None}])
+def test_account_entry_without_restrictions_allows_moves(policy):
+    settings = Settings.model_validate({"accounts": {"work": policy}})
+    assert settings.destination("work", ["Archive"]) == ["Archive"]
+
+
+def test_explicit_empty_destinations_blocks_moves():
+    settings = Settings.model_validate({"accounts": {"work": {"allowed_destinations": []}}})
+    with pytest.raises(ValueError, match="configured"):
+        settings.destination("work", ["Archive"])
 
 
 @pytest.mark.parametrize("address", ["a@example.org\nBcc: b@example.org", "invalid", ""])
