@@ -82,6 +82,38 @@ def test_unknown_write_outcome_blocks_following_writes(tmp_path):
     assert len(mail.requests) == 1
 
 
+def test_uncertain_write_errors_explain_manual_recovery_and_reads_still_work(tmp_path):
+    mail = FixtureMail()
+    server = create_server(bridge=mail, state_dir=tmp_path)
+    mail.fail_write = True
+    with pytest.raises(Exception) as initial:
+        call(server, "set_message_status", {"ref": REF, "read": True})
+    mail.fail_write = False
+    restarted = create_server(bridge=mail, state_dir=tmp_path)
+    with pytest.raises(Exception) as blocked:
+        call(restarted, "set_message_status", {"ref": REF, "read": False})
+    for error in (initial, blocked):
+        assert str(tmp_path / "write-uncertain") in str(error.value)
+        assert "Stop all" in str(error.value)
+        assert "Inspect Mail" in str(error.value)
+        assert "writes.lock" in str(error.value)
+        assert "Restart" in str(error.value)
+    assert len(mail.requests) == 1
+    assert call(restarted, "read_message", {"ref": REF})["operation"] == "read_message"
+    assert (tmp_path / "write-uncertain").exists()
+
+
+def test_show_draft_accepts_zero_but_rejects_negative_ids(tmp_path):
+    mail = FixtureMail()
+    server = create_server(bridge=mail, state_dir=tmp_path)
+    args = {"account_id": "work", "draft_id": 0, "sender": "work@example.org"}
+    assert call(server, "show_draft", args)["draft_id"] == 0
+    before = len(mail.requests)
+    with pytest.raises(Exception):
+        call(server, "show_draft", {**args, "draft_id": -1})
+    assert len(mail.requests) == before
+
+
 def test_mail_closed_is_a_tool_error_and_connection_recovers(tmp_path):
     class StoppedMail:
         running = False

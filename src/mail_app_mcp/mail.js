@@ -62,7 +62,7 @@ function validate(operation, args) {
   }
   if (operation === 'create_draft' || operation === 'reply_draft') validateDraft(operation, args);
   if (operation === 'show_draft') {
-    requireValue(string(args.account_id) && integer(args.draft_id, 1, Number.MAX_SAFE_INTEGER) &&
+    requireValue(string(args.account_id) && integer(args.draft_id, 0, Number.MAX_SAFE_INTEGER) &&
       address(args.sender), 'Invalid draft identity');
   }
 }
@@ -302,8 +302,16 @@ function searchMessages(mail, args) {
 }
 
 function attachmentInfo(attachment) {
-  return { attachment_id: attachment.id(), name: attachment.name(), mime_type: attachment.mimeType(),
-    size: attachment.fileSize(), downloaded: attachment.downloaded() };
+  var mime;
+  try { mime = { mime_type: attachment.mimeType() }; }
+  catch (error) {
+    if (error.errorNumber !== -10000) throw error;
+    // Mail can expose an attachment while its MIME property handler fails.
+    mime = { mime_type: 'application/octet-stream',
+      warning: 'MIME type unavailable from Mail (apple_script_error_number=-10000); returning binary data.' };
+  }
+  return Object.assign({}, mime, { attachment_id: attachment.id(), name: attachment.name(),
+    size: attachment.fileSize(), downloaded: attachment.downloaded() });
 }
 
 function checkBodySize(message) {
@@ -386,7 +394,8 @@ function saveAttachment(mail, args) {
   // Mail.sdef calls fileSize approximate; the Python bridge also checks the saved bytes.
   requireValue(integer(info.size, 0, args.max_bytes), 'Attachment size exceeds limit or is unknown');
   mail.save(attachment, { in: Path(args.path) });
-  return { name: info.name, mime_type: info.mime_type, size: info.size };
+  return Object.assign({ name: info.name, mime_type: info.mime_type, size: info.size },
+    info.warning ? { warning: info.warning } : {});
 }
 
 function verifySender(mail, accountId, sender) {
@@ -407,7 +416,7 @@ function openDraftWindow(mail, draft) {
 function saveDraft(mail, draft, accountId, sender, openWindow) {
   mail.save(draft);
   var id = draft.id();
-  requireValue(integer(id, 1, Number.MAX_SAFE_INTEGER) && draft.sender() === sender,
+  requireValue(integer(id, 0, Number.MAX_SAFE_INTEGER) && draft.sender() === sender,
     'Draft outcome unknown; do not retry automatically');
   if (openWindow) openDraftWindow(mail, draft);
   return { draft_id: id, account_id: accountId, sender: sender, status: 'draft' };

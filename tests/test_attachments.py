@@ -36,6 +36,16 @@ def test_binary_attachment_returns_explicit_base64(tmp_path):
     assert result["base64"] == "AAH/"
 
 
+def test_mime_warning_survives_attachment_export(tmp_path):
+    class UnavailableMimeMail(AttachmentMail):
+        def call(self, operation, args):
+            return {**super().call(operation, args), "warning": "MIME type unavailable from Mail"}
+
+    result = read_attachment_content(UnavailableMimeMail(b"data", "application/octet-stream"), tmp_path, REF, "att")
+    assert result["warning"] == "MIME type unavailable from Mail"
+    assert result["encoding"] == "base64"
+
+
 def test_attachment_size_is_checked_after_export(tmp_path):
     with pytest.raises(ValueError, match="limit"):
         read_attachment_content(AttachmentMail(b"x" * (10 * 1024 * 1024 + 1)), tmp_path, REF, "attachment-1")
