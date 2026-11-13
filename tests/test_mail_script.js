@@ -388,6 +388,15 @@ test('status verification rejects cached success when freshly resolved state rev
 
 test('moves within account and rejects resolved special destinations and stale source', () => {
   const { mail, ref, inbox, messages } = fixture();
+  const transfer = mail.move;
+  let writes = 0;
+  inbox.messages = collection([new Proxy(messages[0], { set(target, key, value) {
+    assert.equal(key, 'mailbox');
+    writes += 1;
+    transfer(target, { to: value });
+    return true;
+  } })]);
+  mail.move = () => assert.fail('Use Mail mailbox assignment');
   for (const name of ['Localized outgoing', 'Localized drafts', 'Localized sent']) {
     assert.throws(() => dispatch(mail, 'move_message', { ref, destination: [name] }), /unsafe/i);
     assert.equal(messages[0].mailbox().name(), 'Inbox');
@@ -395,13 +404,14 @@ test('moves within account and rejects resolved special destinations and stale s
   assert.deepEqual(dispatch(mail, 'move_message', { ref, destination: ['Archive'] }),
     { account_id: 'a1', destination: ['Archive'], moved: true });
   assert.equal(messages[0].mailbox().name(), 'Archive');
+  assert.equal(writes, 1);
   inbox.messages = collection([]);
   assert.throws(() => dispatch(mail, 'move_message', { ref, destination: ['Inbox'] }), /missing/i);
 });
 
 test('a cached destination property cannot verify a no-op move', () => {
   const { mail, ref, messages, archive } = fixture();
-  mail.move = () => { messages[0].mailbox = archive; };
+  mail.move = () => assert.fail('Use Mail mailbox assignment');
   assert.throws(() => dispatch(mail, 'move_message', { ref, destination: ['Archive'] }),
     /Outcome unknown:.*Move verification failed/);
 });
@@ -435,22 +445,41 @@ test('a move verifies fresh mailbox membership after the source handle disappear
     archive.messages = collection([scripting({ id: 99, messageId: ref.header_message_id, mailbox: archive })]);
   }
   inbox.messages = collection([stale]);
-  mail.move = move;
+  mail.move = () => assert.fail('Use Mail mailbox assignment');
   assert.equal(dispatch(mail, 'move_message', { ref, destination: ['Archive'] }).moved, true);
 });
 
 test('a move reporting -1728 is successful only when fresh membership proves it', () => {
   for (const completed of [true, false]) {
-    const { mail, ref } = fixture();
-    const move = mail.move;
-    mail.move = (message, args) => {
-      if (completed) move(message, args);
+    const { mail, ref, inbox, messages } = fixture();
+    const transfer = mail.move;
+    let writes = 0;
+    inbox.messages = collection([new Proxy(messages[0], { set(target, key, value) {
+      assert.equal(key, 'mailbox');
+      writes += 1;
+      if (completed) transfer(target, { to: value });
       throw Object.assign(new Error("Can't get object"), { errorNumber: -1728 });
-    };
+    } })]);
+    mail.move = () => assert.fail('Use Mail mailbox assignment');
     const action = () => dispatch(mail, 'move_message', { ref, destination: ['Archive'] });
     if (completed) assert.equal(action().moved, true);
     else assert.throws(action, /Outcome unknown:.*Move verification failed/);
+    assert.equal(writes, 1);
   }
+});
+
+test('a message disappearing without reaching the destination is an uncertain move', () => {
+  const { mail, ref, inbox, messages } = fixture();
+  let writes = 0;
+  inbox.messages = collection([new Proxy(messages[0], { set() {
+    writes += 1;
+    inbox.messages = collection([]);
+    return true;
+  } })]);
+  mail.move = () => assert.fail('Use Mail mailbox assignment');
+  assert.throws(() => dispatch(mail, 'move_message', { ref, destination: ['Archive'] }),
+    /Outcome unknown:.*Move verification failed/);
+  assert.equal(writes, 1);
 });
 
 test('attachment saves reject absent, unavailable and oversize attachments before saving', () => {

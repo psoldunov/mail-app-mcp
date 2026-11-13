@@ -127,14 +127,14 @@ Returns `name`, `mime_type`, `size` (actual exported bytes), `untrusted: true`, 
 | Content | Returned fields and limits |
 | --- | --- |
 | `text/*` | `text`, `truncated`, `encoding`. Decoded as UTF-8 with replacement for invalid bytes; output at most 100,000 characters. HTML is returned as text without rendering. |
-| `application/pdf` | `text`, `truncated`, `pages` (total document pages). Extracts at most the first 50 pages and 100,000 characters. Encrypted, malformed, or resource-exhausting files fail. Extracted text containing NUL characters is rejected because it can hide unmapped punctuation; the server does not guess replacements. Image-only PDFs may produce empty text; no OCR. |
+| `application/pdf` | `text`, `truncated`, `pages` (total document pages). Extracts at most the first 50 pages and 100,000 characters. Unmapped NUL characters in the returned text become U+FFFD (`�`), with a `warning` giving their count. Readable text remains available; verify affected amounts or punctuation against the original PDF. Encrypted, malformed, or resource-exhausting files fail. Image-only PDFs may produce empty text; no OCR. |
 | Other MIME types | `base64`, `encoding: "base64"`. The binary file must be at most 1 MiB. Images also use base64; there is no image rendering or recognition. |
 
 Every export must already be downloaded in Mail and fit the 10 MiB attachment limit. PDF parsing runs in a subprocess with a 10-second parent-enforced timeout and a 5-second CPU limit. A macOS watchdog samples peak resident memory every 20 milliseconds and terminates the worker above 512 MiB; allocation can overshoot between samples. This is not a hard memory cap or a security sandbox. Resource limits can reject a valid but expensive PDF. There is no password input.
 
 The server chooses a private temporary path and removes the export after processing. It accepts no path, URL, or upload, and returns no filesystem path or reusable handle. Attachment content, filenames, and MIME metadata remain untrusted.
 
-When Mail cannot supply MIME metadata (`-10000`), extraction uses the type guessed from the file name, as `read_message` reports it, and returns the same warning. A `.pdf` or `.txt` name therefore gets PDF or text extraction; a name with no known type gets bounded base64, subject to the 1 MiB binary limit.
+When Mail cannot supply MIME metadata (`-10000`), extraction uses the type guessed from the file name, as `read_message` reports it, and returns the same warning. If PDF extraction also produces a warning, `warning` contains both. A `.pdf` or `.txt` name therefore gets PDF or text extraction; a name with no known type gets bounded base64, subject to the 1 MiB binary limit. PDF worker errors retain the worker's reason in the tool error.
 
 ## create_draft
 
@@ -227,7 +227,9 @@ At least one of `read` or `flagged` must be supplied as a boolean. Returns `ref`
 
 The destination must already exist in the same account. Without an account policy, or with omitted or `null` `allowed_destinations`, ordinary same-account destinations are permitted. An explicit list, including `[]`, permits only its entries plus an explicit `trash_mailbox` override. There is no destination-account argument, folder creation, or cross-account move. Moving to the current mailbox is rejected. Sending destinations and resolved Drafts/Sent destinations are rejected even when configured.
 
-A move requires a nonempty Message-ID unique in the source and absent from the destination. Overlapping labels, including Gmail INBOX to All Mail, are rejected before writing; archive these messages manually in Mail. The server never substitutes delete for archive. After one native move command, fresh mailbox queries must show that the message left the source and exists uniquely in the destination. Verification waits up to ten half-second polls; Apple-event latency adds to that time. A failed verification leaves the outcome uncertain.
+A move requires a nonempty Message-ID unique in the source and absent from the destination. Overlapping labels, including Gmail INBOX to All Mail, are rejected before writing; archive these messages manually in Mail. The server never substitutes delete for archive. After one assignment to Mail's writable message `mailbox` property, fresh mailbox queries must show that the message left the source and exists uniquely in the destination. Verification waits up to ten half-second polls; Apple-event latency adds to that time. Mail error `-1728` after assignment is accepted only if these queries prove the transfer. A failed verification leaves the outcome uncertain.
+
+The native `move` command timed out and misfiled a Gmail label move in field testing. Mailbox assignment restores the earlier write method while retaining fresh verification. Its behavior on Gmail labels still needs supervised acceptance testing; a timeout may complete later. Inspect both mailboxes before clearing an uncertain-write marker, and do not retry automatically.
 
 Returns `account_id`, `destination`, and `moved: true` only after verification. It does not return a new reference: list the destination mailbox again before another operation because Mail IDs can change after a move.
 

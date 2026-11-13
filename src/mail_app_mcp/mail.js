@@ -474,9 +474,10 @@ function moveMessage(mail, args) {
   requireValue(boxFor(mail, args.ref.account_id, args.ref.mailbox).messages
     .whose({ messageId: args.ref.header_message_id })().length === 1, 'Source Message-ID is ambiguous');
   return mutation(function () {
-    try { mail.move(message, { to: destination }); }
+    // Mail's move command timed out and misfiled a Gmail label move; use its writable mailbox property.
+    try { message.mailbox = destination; }
     catch (error) {
-      // Mail may invalidate the command's result specifier after completing the move.
+      // Mail may invalidate the source specifier after completing the assignment.
       if (error.errorNumber !== -1728) throw error;
     }
     for (var poll = 0; poll < MOVE_POLLS; poll += 1) {

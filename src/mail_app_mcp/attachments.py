@@ -32,7 +32,9 @@ def extract_content(path: Path, mime: str) -> dict:
                 cause = (result.stderr.strip().splitlines() or ["no error output"])[-1][:200]
                 raise ValueError(f"PDF extraction failed or exceeded resource limits ({cause})")
             content = json.loads(result.stdout)
-            if not isinstance(content, dict) or "text" not in content:
+            if isinstance(content, dict) and isinstance(content.get("error"), str) and content["error"]:
+                raise ValueError(f"PDF extraction failed: {content['error'][:1000]}")
+            if not isinstance(content, dict) or not isinstance(content.get("text"), str):
                 raise ValueError("PDF extraction failed; encrypted, malformed, or unsupported document")
             return content
         except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError) as exc:
@@ -71,6 +73,7 @@ def read_attachment_content(bridge, directory: Path, ref: MessageRef, attachment
         mime = metadata.get("mime_type", "application/octet-stream")
         if not isinstance(mime, str):
             raise ValueError("Invalid attachment MIME type")
+        content = extract_content(path, mime.split(";", 1)[0].lower())
+        warnings = [item["warning"] for item in (metadata, content) if isinstance(item.get("warning"), str)]
         return {"name": metadata.get("name", "attachment"), "mime_type": mime, "size": info.st_size,
-                "untrusted": True, **({"warning": metadata["warning"]} if "warning" in metadata else {}),
-                **extract_content(path, mime.split(";", 1)[0].lower())}
+                "untrusted": True, **content, **({"warning": " ".join(warnings)} if warnings else {})}

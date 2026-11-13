@@ -50,13 +50,14 @@ pdf_text.main()
 
 @pytest.mark.parametrize("mapping,expected", [
     (b"<2B> <0000> <2D> <0000> <28> <0000> <29> <0000>", {
-        "error": "PDF text contains unmapped characters; reliable extraction is unavailable",
+        "text": "INV\ufffd2026 \ufffdUsage\ufffd \ufffd$10.00", "pages": 1, "truncated": False,
+        "warning": "4 characters could not be mapped; replaced with U+FFFD",
     }),
     (b"<2B> <002B> <2D> <002D> <28> <0028> <29> <0029>", {
         "text": "INV-2026 (Usage) +$10.00", "pages": 1, "truncated": False,
     }),
 ])
-def test_pdf_worker_preserves_punctuation_or_rejects_unmapped_glyphs(tmp_path, mapping, expected):
+def test_pdf_worker_preserves_readable_text_and_warns_about_unmapped_glyphs(tmp_path, mapping, expected):
     from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
     from mail_app_mcp.pdf_text import extract_pdf
 
@@ -94,3 +95,5 @@ endcmap CMapName currentdict /CMap defineresource pop end end""")
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout) == expected
     assert extract_pdf(path) == expected
+    from mail_app_mcp.attachments import extract_content
+    assert extract_content(path, "application/pdf") == expected

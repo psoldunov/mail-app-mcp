@@ -46,6 +46,23 @@ def test_mime_warning_survives_attachment_export(tmp_path):
     assert result["encoding"] == "base64"
 
 
+def test_mime_and_pdf_warnings_both_survive_attachment_export(tmp_path, monkeypatch):
+    import json
+    import subprocess
+
+    class UnavailableMimeMail(AttachmentMail):
+        def call(self, operation, args):
+            return {**super().call(operation, args), "warning": "MIME type unavailable from Mail"}
+
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: subprocess.CompletedProcess(
+        args, 0, json.dumps({"text": "cost \ufffd10", "warning": "1 characters could not be mapped"}), ""))
+    result = read_attachment_content(
+        UnavailableMimeMail(b"pdf", "application/octet-stream", "invoice.pdf"), tmp_path, REF, "att")
+    assert result["text"] == "cost \ufffd10"
+    assert "guessed from the untrusted file name" in result["warning"]
+    assert "1 characters could not be mapped" in result["warning"]
+
+
 def test_attachment_size_is_checked_after_export(tmp_path):
     with pytest.raises(ValueError, match="limit"):
         read_attachment_content(AttachmentMail(b"x" * (10 * 1024 * 1024 + 1)), tmp_path, REF, "attachment-1")
@@ -96,6 +113,16 @@ def test_pdf_child_failure_reports_its_cause(tmp_path, monkeypatch):
     monkeypatch.delenv("NIX_PYTHONPATH", raising=False)
     monkeypatch.setattr(sys, "executable", sys._base_executable)
     with pytest.raises(ValueError, match="No module named"):
+        read_attachment_content(AttachmentMail(b"%PDF-1.4", "application/pdf"), tmp_path, REF, "att")
+
+
+def test_pdf_child_error_payload_preserves_the_specific_reason(tmp_path, monkeypatch):
+    import json
+    import subprocess
+
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: subprocess.CompletedProcess(
+        args, 0, json.dumps({"error": "PDF text extraction is unavailable for this font"}), ""))
+    with pytest.raises(ValueError, match="PDF text extraction is unavailable for this font"):
         read_attachment_content(AttachmentMail(b"%PDF-1.4", "application/pdf"), tmp_path, REF, "att")
 
 
