@@ -176,3 +176,21 @@ def test_slow_mail_does_not_block_protocol_requests(tmp_path):
                 await request
 
     asyncio.run(scenario())
+
+
+def test_global_search_schema_and_scope(tmp_path):
+    mail = FixtureMail()
+    server = create_server(bridge=mail, state_dir=tmp_path)
+    result = call(server, "search_messages", {"from": "isabel", "sort": "newest", "limit": 1})
+    assert result == {"operation": "search_messages", "from": "isabel", "sort": "newest",
+                      "limit": 1, "account_id": None, "mailbox": None}
+    tool = next(tool for tool in asyncio.run(server.list_tools()) if tool.name == "search_messages")
+    assert "from" in tool.inputSchema["properties"]
+    assert tool.annotations.readOnlyHint
+    scoped = call(server, "search_messages", {"from": "a", "account_id": "work", "mailbox": ["Inbox"]})
+    assert scoped["account_id"] == "work" and scoped["mailbox"] == ["Inbox"]
+    for invalid in ({"mailbox": ["Inbox"]}, {"sort": "random"}, {"limit": 0}, {"from": "x" * 1001}):
+        before = len(mail.requests)
+        with pytest.raises(Exception):
+            call(server, "search_messages", invalid)
+        assert len(mail.requests) == before

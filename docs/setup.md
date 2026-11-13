@@ -2,7 +2,7 @@
 
 ## Prerequisites and permissions
 
-Live use requires macOS, Apple Mail with accounts already configured, and a local MCP client that can launch a stdio server. Open Mail manually before calling a tool. Hiding Mail or closing its windows is fine while the process remains running. Only explicit show calls or draft calls with `open_window: true` request an item window and may bring already-running Mail forward.
+Live use requires macOS, Apple Mail with accounts already configured, and a local MCP client that can launch a stdio server. A tool call starts Mail hidden when it is closed; an already-running session is left visible or hidden as it was. Mail can synchronize and process queued mail on startup. Only explicit show calls or draft calls with `open_window: true` request an item window and may bring already-running Mail forward.
 
 The first Mail request may prompt for Automation permission. macOS attributes that permission to the responsible application, which can differ between a terminal and an MCP client. Grant access only to the launcher you intend to use. A successful terminal test does not establish permission for a different client.
 
@@ -124,7 +124,7 @@ Use actual absolute paths; do not rely on shell expansion of `~`. Starting the e
 
 | Symptom | Action |
 | --- | --- |
-| Mail is not running | The tool returns an error while the MCP connection stays open. Open Mail yourself and retry a read; no server restart is needed. The server does not launch Mail or run a retry loop. |
+| Mail cannot start | The tool reports the startup error while the MCP connection stays open. Open Mail manually to inspect setup or permission prompts, then retry a read. |
 | Automation permission denied | Check the responsible launcher under macOS Automation settings. Inspect Mail before repeating any attempted write. |
 | `programs.mcp` option is missing | Use a Home Manager revision that provides it, such as the pinned revision in the README. |
 | Server is missing in the client | Check that the client consumes Home Manager's configuration or copy the generated command/args into its own settings. |

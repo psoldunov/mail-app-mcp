@@ -1,13 +1,16 @@
 'use strict';
 
-var OPERATIONS = ['list_accounts', 'list_mailboxes', 'list_messages', 'read_message',
+var OPERATIONS = ['list_accounts', 'list_mailboxes', 'list_messages', 'search_messages', 'read_message',
   'save_attachment', 'set_message_status', 'move_message', 'create_draft', 'reply_draft',
   'show_message', 'show_draft'];
+var READ_OPERATIONS = ['list_accounts', 'list_mailboxes', 'list_messages', 'search_messages', 'read_message'];
 var MAX_BOXES = 1000;
 var MAX_BODY_BYTES = 20 * 1024 * 1024;
 var MAX_SCAN = 200;
 var HEADER_BATCH_SIZE = 10;
 var SEARCH_BUDGET_MS = 10000;
+var MAX_SEARCH_MATCHES = 20000;
+var GLOBAL_SEARCH_BUDGET_MS = 20000;
 
 function requireValue(condition, message) {
   if (!condition) {
@@ -34,6 +37,12 @@ function validate(operation, args) {
     requireValue(validPath(args.mailbox) && integer(args.offset, 0, Number.MAX_SAFE_INTEGER) &&
       integer(args.limit, 1, 100) && typeof args.query === 'string' &&
       typeof args.search_body === 'boolean', 'Invalid message search');
+  }
+  if (operation === 'search_messages') {
+    requireValue(typeof args.from === 'string' && args.from.length <= 1000 &&
+      ['newest', 'oldest'].indexOf(args.sort) !== -1 && integer(args.limit, 1, 100) &&
+      (args.account_id == null || string(args.account_id)) &&
+      (args.mailbox == null || (string(args.account_id) && validPath(args.mailbox))), 'Invalid global search');
   }
   if (['read_message', 'save_attachment', 'set_message_status', 'move_message', 'reply_draft', 'show_message'].indexOf(operation) !== -1) {
     var ref = args.ref;
@@ -207,6 +216,91 @@ function listMessages(mail, args) {
   return { messages: found, next_offset: index < total ? index : null, complete: index >= total, scanned: scanned };
 }
 
+function searchBoxes(mail, args) {
+  if (args.mailbox) return [{ box: boxFor(mail, args.account_id, args.mailbox), account_id: args.account_id }];
+  var accounts = args.account_id === '__local__' ? [] :
+    (args.account_id ? [accountFor(mail, args.account_id)] : mail.accounts());
+  var boxes = accounts.reduce(function (result, account) {
+    var id = account.id();
+    var items = account.mailboxes();
+    requireValue(result.length + items.length <= MAX_BOXES, 'Search scope exceeds 1000 mailboxes; narrow account_id or mailbox');
+    return result.concat(items.map(function (box) { return { box: box, account_id: id }; }));
+  }, []);
+  if (!args.account_id || args.account_id === '__local__') {
+    var local = mail.mailboxes();
+    requireValue(local.length <= MAX_BOXES, 'Local mailbox inventory exceeds 1000 mailboxes');
+    boxes = boxes.concat(local.filter(function (box) { return !box.account(); }).map(function (box) {
+      return { box: box, account_id: '__local__' };
+    }));
+  }
+  requireValue(boxes.length <= MAX_BOXES, 'Search scope exceeds 1000 mailboxes; narrow account_id or mailbox');
+  return boxes;
+}
+
+function searchDeadline(deadline) {
+  requireValue(Date.now() < deadline, 'Search time limit exceeded; latest match not established. Narrow account_id or mailbox and retry');
+}
+
+function searchCandidates(scope, sender, remaining) {
+  // Mail evaluates this predicate; never fetch subjects or bodies for nonmatches.
+  var selected = sender ? scope.box.messages.whose({ sender: { _contains: sender } }) : scope.box.messages;
+  var count = selected.length;
+  requireValue(integer(count, 0, remaining), 'Search exceeds 20000 matching headers; narrow account_id, mailbox or from');
+  if (!count) return [];
+  var ids = selected.id();
+  var dates = selected.dateReceived();
+  requireValue(Array.isArray(ids) && Array.isArray(dates) && ids.length === count && dates.length === count &&
+    JSON.stringify(selected.id()) === JSON.stringify(ids), 'Mailbox changed while searching; retry search');
+  return ids.map(function (id, index) {
+    var date = dates[index];
+    requireValue(integer(id, 1, Number.MAX_SAFE_INTEGER) && date && typeof date.getTime === 'function' &&
+      Number.isFinite(date.getTime()), 'Invalid message ID or received date; latest match not established');
+    return { scope: scope, id: id, timestamp: date.getTime() };
+  });
+}
+
+function searchMessages(mail, args) {
+  var started = Date.now();
+  var deadline = started + GLOBAL_SEARCH_BUDGET_MS;
+  var boxes = searchBoxes(mail, args);
+  searchDeadline(deadline);
+  var discovered = Date.now();
+  var candidates = boxes.reduce(function (result, scope) {
+    searchDeadline(deadline);
+    return result.concat(searchCandidates(scope, args.from, MAX_SEARCH_MATCHES - result.length));
+  }, []);
+  var unique = candidates.slice().sort(function (a, b) {
+    return a.scope.account_id.localeCompare(b.scope.account_id) || a.id - b.id;
+  }).filter(function (candidate, index, all) {
+    var previous = all[index - 1];
+    if (!previous || previous.scope.account_id !== candidate.scope.account_id || previous.id !== candidate.id) return true;
+    requireValue(previous.timestamp === candidate.timestamp, 'Duplicate message dates changed; retry search');
+    return false;
+  });
+  var ordered = unique.slice().sort(function (a, b) {
+    var dateOrder = args.sort === 'newest' ? b.timestamp - a.timestamp : a.timestamp - b.timestamp;
+    return dateOrder || a.scope.account_id.localeCompare(b.scope.account_id) || a.id - b.id;
+  });
+  searchDeadline(deadline);
+  var filtered = Date.now();
+  var found = [];
+  for (var index = 0; index < ordered.length && found.length < args.limit; index += 1) {
+    searchDeadline(deadline);
+    var candidate = ordered[index];
+    var message = one(candidate.scope.box.messages.whose({ id: candidate.id })(), 'Search result');
+    var item = summary(message, candidate.scope);
+    requireValue(item.ref.message_id === candidate.id && Date.parse(item.date_received) === candidate.timestamp &&
+      (!args.from || item.sender.toLowerCase().indexOf(args.from.toLowerCase()) !== -1),
+    'Message changed while searching; retry search');
+    found = found.concat([item]);
+  }
+  searchDeadline(deadline);
+  return { messages: found.slice(0, args.limit), complete: true, has_more: ordered.length > args.limit,
+    sort: args.sort, matched_candidates: candidates.length, mailboxes_searched: boxes.length,
+    timing_ms: { discovery: discovered - started, filter_and_sort: filtered - discovered,
+      summaries: Date.now() - filtered, total: Date.now() - started } };
+}
+
 function attachmentInfo(attachment) {
   return { attachment_id: attachment.id(), name: attachment.name(), mime_type: attachment.mimeType(),
     size: attachment.fileSize(), downloaded: attachment.downloaded() };
@@ -248,7 +342,12 @@ function rejectUnsafeBox(mail, box, destination) {
 
 function mutation(action) {
   try { return action(); }
-  catch (error) { requireValue(false, 'Outcome unknown: mutation was attempted. Do not retry automatically.'); }
+  catch (error) {
+    var failure = new Error('Outcome unknown: mutation was attempted. Do not retry automatically. ' + String(error.message || error).slice(0, 1000));
+    failure.safeMessage = true;
+    failure.errorNumber = error.errorNumber;
+    throw failure;
+  }
 }
 
 function setStatus(mail, args) {
@@ -365,6 +464,7 @@ function dispatch(mail, operation, args) {
   case 'list_accounts': return listAccounts(mail);
   case 'list_mailboxes': return listMailboxes(mail, args);
   case 'list_messages': return listMessages(mail, args);
+  case 'search_messages': return searchMessages(mail, args);
   case 'read_message': return readMessage(mail, args);
   case 'save_attachment': return saveAttachment(mail, args);
   case 'set_message_status': return setStatus(mail, args);
@@ -376,6 +476,35 @@ function dispatch(mail, operation, args) {
   }
 }
 
+function mailProcess() {
+  var processes = $.NSRunningApplication.runningApplicationsWithBundleIdentifier('com.apple.mail');
+  if (Number(processes.count) === 0) {
+    var workspace = $.NSWorkspace.sharedWorkspace;
+    var launchError = Ref();
+    var launched = workspace.launchApplicationAtURLOptionsConfigurationError(
+      workspace.URLForApplicationWithBundleIdentifier('com.apple.mail'),
+      $.NSWorkspaceLaunchWithoutActivation | $.NSWorkspaceLaunchAndHide,
+      $.NSDictionary.dictionary, launchError);
+    requireValue(Boolean(ObjC.unwrap(launched)), launchError[0]
+      ? 'Could not launch Mail hidden: ' + ObjC.unwrap(launchError[0].localizedDescription)
+      : 'Could not launch Mail hidden');
+    var deadline = Date.now() + 5000;
+    do {
+      processes = $.NSRunningApplication.runningApplicationsWithBundleIdentifier('com.apple.mail');
+      var candidate = Number(processes.count) === 1 ? processes.objectAtIndex(0) : null;
+      if ((candidate && !candidate.terminated && integer(Number(candidate.processIdentifier), 1, Number.MAX_SAFE_INTEGER)) ||
+          Number(processes.count) > 1 || Date.now() >= deadline) break;
+      $.NSThread.sleepForTimeInterval(0.1);
+    } while (true);
+  }
+  requireValue(Number(processes.count) === 1, 'Mail did not start or its running process is ambiguous');
+  var process = processes.objectAtIndex(0);
+  requireValue(!process.terminated, 'Mail is no longer running');
+  var pid = Number(process.processIdentifier);
+  requireValue(integer(pid, 1, Number.MAX_SAFE_INTEGER), 'Invalid running Mail process');
+  return pid;
+}
+
 function run() {
   try {
     ObjC.import('Foundation');
@@ -385,18 +514,16 @@ function run() {
     requireValue(request && typeof request === 'object', 'Invalid request');
     validate(request.operation, request.args);
     ObjC.import('AppKit');
-    var processes = $.NSRunningApplication.runningApplicationsWithBundleIdentifier('com.apple.mail');
-    requireValue(Number(processes.count) === 1, 'Mail must already be running');
-    var process = processes.objectAtIndex(0);
-    requireValue(!process.terminated, 'Mail must already be running');
-    var pid = Number(process.processIdentifier);
-    requireValue(integer(pid, 1, Number.MAX_SAFE_INTEGER), 'Invalid running Mail process');
     // A PID target cannot relaunch Mail if it exits between lookup and the Apple event.
-    var mail = Application(pid);
+    var mail = Application(mailProcess());
     return JSON.stringify({ ok: true, result: dispatch(mail, request.operation, request.args) });
   } catch (error) {
-    return JSON.stringify({ ok: false, error: error.safeMessage ? error.message :
-      'Outcome unknown: Mail automation failed. Do not retry mutations automatically.' });
+    var operation = request && request.operation;
+    var readOnly = READ_OPERATIONS.indexOf(operation) !== -1;
+    var detail = String(error.message || error).slice(0, 1000);
+    return JSON.stringify({ ok: false, operation: operation,
+      apple_script_error_number: typeof error.errorNumber === 'number' ? error.errorNumber : null,
+      error: error.safeMessage || readOnly ? detail : 'Outcome unknown: ' + detail });
   }
 }
 

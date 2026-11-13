@@ -11,10 +11,14 @@ function collection(items) {
   const value = () => items.slice();
   Object.defineProperty(value, 'length', { get: () => items.length });
   items.forEach((item, index) => { value[index] = item; });
-  value.whose = (criteria) => () => items.filter((item) =>
-    Object.keys(criteria).every((key) => item[key]() === criteria[key]));
+  value.whose = (criteria) => collection(items.filter((item) =>
+    Object.keys(criteria).every((key) => typeof criteria[key] === 'object'
+      ? item[key]().toLowerCase().includes(criteria[key]._contains.toLowerCase())
+      : item[key]() === criteria[key])));
   value.slice = (start, end) => collection(items.slice(start, end + 1));
   value.subject = () => items.map((item) => item.subject());
+  value.id = () => items.map((item) => item.id());
+  value.dateReceived = () => items.map((item) => item.dateReceived());
   value.sender = () => items.map((item) => item.sender());
   value.push = (item) => { items.push(item); };
   return value;
@@ -330,15 +334,30 @@ test('native reply preserves original content and saves without sending', () => 
   assert.equal(saved[0].sender(), 'me@example.com');
 });
 
-function runtime(request, processes, application) {
+function runtime(request, processes, application, options = {}) {
+  let now = 0;
   const context = vm.createContext({
     ObjC: { import() {}, unwrap: (value) => value },
+    Ref: () => [],
+    Date: { now: () => now },
     $: { NSUTF8StringEncoding: 4,
       NSFileHandle: { fileHandleWithStandardInput: { readDataToEndOfFile: JSON.stringify(request) } },
       NSString: { alloc: { initWithDataEncoding: (data) => data } },
+      NSDictionary: { dictionary: {} },
+      NSWorkspaceLaunchWithoutActivation: 512,
+      NSWorkspaceLaunchAndHide: 1048576,
+      NSWorkspace: { sharedWorkspace: {
+        URLForApplicationWithBundleIdentifier: (id) => {
+          assert.equal(id, 'com.apple.mail');
+          return 'file:///System/Applications/Mail.app';
+        },
+        launchApplicationAtURLOptionsConfigurationError: options.launch || (() => assert.fail('Must not launch Mail')),
+      } },
+      NSThread: { sleepForTimeInterval: (seconds) => { now += seconds * 1000; } },
       NSRunningApplication: { runningApplicationsWithBundleIdentifier: (id) => {
         assert.equal(id, 'com.apple.mail');
-        return { count: processes.length, objectAtIndex: (index) => processes[index] };
+        const current = typeof processes === 'function' ? processes() : processes;
+        return { count: current.length, objectAtIndex: (index) => current[index] };
       } },
     },
     Application: application,
@@ -358,20 +377,78 @@ test('stdin entrypoint targets a running PID and returns only a JSON envelope', 
   assert.equal(result.result.accounts[0].account_id, 'a1');
 });
 
-test('stdin entrypoint never resolves an application for rejected operations or stopped Mail', () => {
+test('stdin entrypoint never launches or resolves an application for rejected requests', () => {
   const forbidden = () => assert.fail('Application must not be resolved');
   assert.match(runtime({ operation: 'send', args: {} }, [], forbidden).error, /Unsupported/);
-  assert.match(runtime({ operation: 'list_accounts', args: {} }, [], forbidden).error, /running/i);
+  assert.match(runtime({ operation: 'list_mailboxes', args: {} }, [], forbidden).error, /Invalid account/);
   assert.match(runtime({ operation: 'list_accounts', args: {} },
     [{ processIdentifier: 123, terminated: true }], forbidden).error, /running/i);
 });
 
-test('unexpected entrypoint failure preserves the Python unknown-outcome latch', () => {
+test('stdin entrypoint launches stopped Mail hidden without activation and waits for its PID', () => {
+  const { mail } = fixture();
+  let launches = 0;
+  let polls = 0;
+  const processes = () => ++polls < 3 ? [] : [{ processIdentifier: 456, terminated: false }];
+  const result = runtime({ operation: 'list_accounts', args: {} }, processes, (pid) => {
+    assert.equal(pid, 456);
+    return mail;
+  }, { launch(url, options) {
+    assert.equal(url, 'file:///System/Applications/Mail.app');
+    assert.equal(options, 512 | 1048576);
+    launches += 1;
+    return {};
+  } });
+  assert.equal(result.ok, true);
+  assert.equal(launches, 1);
+  assert.equal(polls, 3);
+});
+
+test('stdin entrypoint waits for a valid running PID after hidden launch', () => {
+  const { mail } = fixture();
+  let polls = 0;
+  const result = runtime({ operation: 'list_accounts', args: {} }, () => {
+    polls += 1;
+    return polls === 1 ? [] : [{ processIdentifier: polls < 4 ? 0 : 456, terminated: false }];
+  }, (pid) => {
+    assert.equal(pid, 456);
+    return mail;
+  }, { launch: () => ({}) });
+  assert.equal(result.ok, true);
+  assert.equal(polls, 4);
+});
+
+test('stdin entrypoint bounds startup waiting and reports launch failures before using Mail', () => {
+  const forbidden = () => assert.fail('Application must not be resolved');
+  let polls = 0;
+  let launches = 0;
+  const timedOut = runtime({ operation: 'list_accounts', args: {} }, () => {
+    polls += 1;
+    return [];
+  }, forbidden, { launch() { launches += 1; return {}; } });
+  assert.equal(timedOut.ok, false);
+  assert.match(timedOut.error, /Mail did not start/);
+  assert.equal(launches, 1);
+  assert.ok(polls > 1 && polls <= 52);
+  const failed = runtime({ operation: 'list_accounts', args: {} }, [], forbidden, {
+    launch(url, options, configuration, error) {
+      error[0] = { localizedDescription: 'Launch Services denied request' };
+      return null;
+    },
+  });
+  assert.equal(failed.ok, false);
+  assert.match(failed.error, /Could not launch Mail hidden: Launch Services denied request/);
+  assert.doesNotMatch(failed.error, /Outcome unknown/);
+});
+
+test('read failures expose the automation cause without an unknown write outcome', () => {
   const result = runtime({ operation: 'list_accounts', args: {} },
-    [{ processIdentifier: 123, terminated: false }], () => { throw new Error('private runtime details'); });
+    [{ processIdentifier: 123, terminated: false }], () => { throw Object.assign(new Error('Not authorized to send Apple events'), { errorNumber: -1743 }); });
   assert.equal(result.ok, false);
-  assert.match(result.error, /^Outcome unknown:/);
-  assert.doesNotMatch(result.error, /private runtime/);
+  assert.match(result.error, /Not authorized/);
+  assert.doesNotMatch(result.error, /Outcome unknown/);
+  assert.equal(result.operation, 'list_accounts');
+  assert.equal(result.apple_script_error_number, -1743);
 });
 
 test('every failure from the first draft, status or move event reports an unknown outcome', () => {
@@ -525,4 +602,134 @@ test('show_draft validates account, draft ID and sender before showing a specifi
   assert.equal(activations, 0);
   assert.deepEqual(dispatch(mail, 'show_draft', args), { shown: true, draft_id: 42, account_id: 'a1' });
   assert.equal(activations, 1);
+});
+
+test('global sender search orders all accounts before applying the limit', () => {
+  const first = fixture(2);
+  const second = fixture();
+  second.account.id = 'a2';
+  first.messages[0].sender = 'Isabel <isabel@example.com>';
+  first.messages[1].sender = 'Someone else';
+  second.messages[0].sender = 'Isabel <isabel@example.com>';
+  second.messages[0].dateReceived = new Date('2026-11-12T00:00:00Z');
+  const mail = { ...first.mail, accounts: collection([first.account, second.account]) };
+  const result = dispatch(mail, 'search_messages', { from: 'isabel', sort: 'newest', limit: 1,
+    account_id: null, mailbox: null });
+  assert.equal(result.messages.length, 1);
+  assert.equal(result.messages[0].ref.account_id, 'a2');
+  assert.equal(result.complete, true);
+  assert.equal(result.has_more, true);
+});
+
+test('search scopes, local mail, duplicate labels and oldest ordering', () => {
+  const { mail, inbox, archive, messages } = fixture(2);
+  messages[0].dateReceived = new Date('2026-10-01T00:00:00Z');
+  archive.messages = collection([messages[0]]);
+  const local = scripting({ name: 'Local', account: null, container: null });
+  const localMessage = scripting({ id: 30, messageId: '<local>', mailbox: local, subject: 'local',
+    sender: 'other@example.com', dateReceived: new Date('2026-11-01T00:00:00Z'), readStatus: false, flaggedStatus: false });
+  local.messages = collection([localMessage]);
+  mail.mailboxes = collection([local, inbox]);
+  const args = { from: '', sort: 'newest', limit: 10, account_id: null, mailbox: null };
+  const result = dispatch(mail, 'search_messages', args);
+  assert.deepEqual(result.messages.map((m) => m.ref.message_id), [30, 1, 2]);
+  assert.equal(result.has_more, false);
+  assert.deepEqual(dispatch(mail, 'search_messages', { ...args, sort: 'oldest' }).messages.map((m) => m.ref.message_id), [2, 1, 30]);
+  assert.equal(dispatch(mail, 'search_messages', { ...args, account_id: '__local__' }).messages.length, 1);
+  assert.equal(dispatch(mail, 'search_messages', { ...args, account_id: 'a1', mailbox: ['Archive'] }).messages.length, 1);
+  assert.equal(dispatch(mail, 'search_messages', { ...args, from: 'absent' }).messages.length, 0);
+  assert.throws(() => dispatch(mail, 'search_messages', { ...args, account_id: 'missing' }), /Account/);
+});
+
+test('global search bounds work and rejects incomplete or changing metadata', () => {
+  const args = { from: '', sort: 'newest', limit: 1, account_id: 'a1', mailbox: null };
+  const { mail, inbox, messages } = fixture();
+  messages[0].dateReceived = new Date('invalid');
+  assert.throws(() => dispatch(mail, 'search_messages', args), /received date/);
+  messages[0].dateReceived = new Date('2026-01-01');
+  inbox.messages.dateReceived = () => [];
+  assert.throws(() => dispatch(mail, 'search_messages', args), /Mailbox changed/);
+  inbox.messages = collection(messages);
+  let reads = 0;
+  inbox.messages.id = () => ++reads === 1 ? [1] : [2];
+  assert.throws(() => dispatch(mail, 'search_messages', args), /Mailbox changed/);
+  inbox.messages = { length: 20001, id: () => assert.fail('Oversize metadata fetched') };
+  assert.throws(() => dispatch(mail, 'search_messages', args), /20000/);
+  for (const bad of [{ sort: 'random' }, { limit: 101 }, { from: 4 }, { account_id: null, mailbox: ['Inbox'] }]) {
+    assert.throws(() => dispatch({}, 'search_messages', { ...args, ...bad }), /Invalid/);
+  }
+});
+
+test('global search never returns partial latest when an account fails or time expires', (t) => {
+  const { mail, account } = fixture();
+  const args = { from: '', sort: 'newest', limit: 1, account_id: null, mailbox: null };
+  const broken = { id: () => 'a2', mailboxes: () => { throw new Error('Account unavailable'); } };
+  mail.accounts = collection([account, broken]);
+  assert.throws(() => dispatch(mail, 'search_messages', args), /Account unavailable/);
+  mail.accounts = collection([account]);
+  let time = 0;
+  t.mock.method(Date, 'now', () => time);
+  mail.mailboxes = () => { time = 20001; return []; };
+  assert.throws(() => dispatch(mail, 'search_messages', args), /latest match not established/);
+});
+
+test('sender filter stays in Mail and only selected summaries fetch subjects', () => {
+  const { mail, inbox, messages } = fixture(1000);
+  messages[999].sender = 'Isabel';
+  messages.forEach((message, index) => {
+    message.content = () => assert.fail('Search fetched body');
+    if (index !== 999) message.subject = () => assert.fail('Nonmatch summary fetched');
+  });
+  let predicate;
+  inbox.messages.whose = (criteria) => {
+    if (criteria.sender) {
+      predicate = criteria;
+      return collection([messages[999]]);
+    }
+    return collection(messages.filter((m) => m.id() === criteria.id));
+  };
+  const result = dispatch(mail, 'search_messages', { from: 'Isabel', sort: 'newest', limit: 1,
+    account_id: 'a1', mailbox: null });
+  assert.deepEqual(predicate, { sender: { _contains: 'Isabel' } });
+  assert.equal(result.matched_candidates, 1);
+  assert.equal(result.messages[0].ref.message_id, 1000);
+  assert.ok(result.timing_ms.total >= 0);
+});
+
+test('global search hydrates one summary for limit one despite many matches and duplicate labels', () => {
+  const { mail, inbox, archive, messages } = fixture(200);
+  archive.messages = collection(messages);
+  let subjects = 0;
+  let ids = 0;
+  let dates = 0;
+  const measured = messages.map((message) => new Proxy(message, {
+    get(target, key) {
+      if (key === 'subject') return () => { subjects += 1; return 'Match'; };
+      return Reflect.get(target, key);
+    },
+  }));
+  inbox.messages = collection(measured);
+  archive.messages = collection(measured);
+  inbox.messages.id = () => { ids += 1; return messages.map((message) => message.id()); };
+  inbox.messages.dateReceived = () => { dates += 1; return messages.map((message) => message.dateReceived()); };
+  const result = dispatch(mail, 'search_messages', { from: '', sort: 'newest', limit: 1,
+    account_id: 'a1', mailbox: null });
+  assert.equal(result.messages.length, 1);
+  assert.equal(result.has_more, true);
+  assert.equal(subjects, 1);
+  assert.equal(ids, 2);
+  assert.equal(dates, 1);
+});
+
+test('global search rejects conflicting label dates and a result that changes after sorting', () => {
+  const { mail, inbox, archive, messages } = fixture();
+  const args = { from: '', sort: 'newest', limit: 1, account_id: 'a1', mailbox: null };
+  archive.messages = collection([scripting({ id: 1, dateReceived: new Date('2020-01-01') })]);
+  assert.throws(() => dispatch(mail, 'search_messages', args), /Duplicate message dates changed/);
+  archive.messages = collection([]);
+  inbox.messages.whose = () => {
+    messages[0].dateReceived = new Date('2020-01-01');
+    return collection(messages);
+  };
+  assert.throws(() => dispatch(mail, 'search_messages', args), /Message changed/);
 });
