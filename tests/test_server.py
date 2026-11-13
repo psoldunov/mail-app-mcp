@@ -161,6 +161,22 @@ def test_show_message_is_serialized_but_never_marks_or_waits_on_uncertainty(tmp_
     assert tool.annotations.destructiveHint is False
 
 
+def test_each_call_logs_its_name_and_duration_but_never_its_arguments(tmp_path, caplog):
+    caplog.set_level("INFO", logger="mail_app_mcp")
+    mail = FixtureMail()
+    server = create_server(bridge=mail, state_dir=tmp_path)
+    call(server, "read_message", {"ref": REF})
+    mail.fail_write = True
+    with pytest.raises(Exception):
+        call(server, "set_message_status", {"ref": REF, "read": True})
+    lines = [record.getMessage() for record in caplog.records if record.name == "mail_app_mcp"]
+    assert [line.split()[:2] for line in lines] == [
+        ["queued", "read_message"], ["start", "read_message"], ["end", "read_message"],
+        ["queued", "set_message_status"], ["start", "set_message_status"], ["fail", "set_message_status"]]
+    assert lines[-1].endswith("OutcomeUnknown")
+    assert not any("msg@example.org" in line for line in lines)
+
+
 def test_read_message_restores_own_address_recipients_and_attachment_types(tmp_path):
     class HeaderMail(FixtureMail):
         def call(self, operation, args):

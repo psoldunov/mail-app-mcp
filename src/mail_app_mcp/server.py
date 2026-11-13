@@ -4,7 +4,9 @@ import argparse
 import email
 import email.policy
 import json
+import logging
 import os
+import time
 from datetime import datetime, timezone
 from email.utils import getaddresses
 from functools import partial, wraps
@@ -32,6 +34,20 @@ SHOW = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint
 DEFAULT_STATE_DIR = Path.home() / "Library" / "Caches" / "mail-app-mcp"
 MARKER = "write-uncertain"
 MAX_MARKER_BYTES = 16_384
+log = logging.getLogger("mail_app_mcp")
+
+
+def logged(function, *args, **kwargs):
+    """Log each call's operation and duration to stderr (never its arguments, which hold mail content)."""
+    started = time.monotonic()
+    log.info("start %s pid=%d", function.__name__, os.getpid())
+    try:
+        result = function(*args, **kwargs)
+    except BaseException as exc:
+        log.info("fail %s after %.1fs: %s", function.__name__, time.monotonic() - started, type(exc).__name__)
+        raise
+    log.info("end %s after %.1fs", function.__name__, time.monotonic() - started)
+    return result
 
 
 def selected_sender(bridge, account_id: str, sender: str) -> str:
@@ -142,7 +158,9 @@ def create_server(settings: Settings | None = None, bridge=None, state_dir: Path
         def register(function):
             @wraps(function)
             async def run(*args, **kwargs):
-                return await anyio.to_thread.run_sync(partial(function, *args, **kwargs), limiter=limiter)
+                # Calls run one at a time; the gap between "queued" and "start" is time spent waiting behind another.
+                log.info("queued %s pid=%d", function.__name__, os.getpid())
+                return await anyio.to_thread.run_sync(partial(logged, function, *args, **kwargs), limiter=limiter)
             return server.tool(annotations=annotations)(run)
         return register
 
@@ -177,7 +195,7 @@ def create_server(settings: Settings | None = None, bridge=None, state_dir: Path
 
         Optional account_id/mailbox narrows scope. complete means all matching headers were considered;
         has_more means additional results exist. A bounded search that cannot finish fails, never claims latest.
-        Unscoped searches over large stores can exceed the 20-second limit; pass account_id (and mailbox) then.
+        Unscoped searches over large stores can exceed the 35-second limit; pass account_id (and mailbox) then.
         """
         if mailbox is not None and account_id is None:
             raise ValueError("mailbox requires account_id")

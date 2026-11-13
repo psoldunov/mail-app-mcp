@@ -136,6 +136,7 @@ Use actual absolute paths; do not rely on shell expansion of `~`. Starting the e
 | Attachment is not downloaded | Download it in Mail manually before calling `read_attachment`. |
 | Attachment exceeds a limit or PDF extraction fails | Open it yourself in a suitable application. The server does not execute attachments, OCR images, or bypass limits. |
 | Runtime directory or lock has unsafe permissions | Inspect `~/Library/Caches/mail-app-mcp` ownership, mode, and symlinks. Its directory must be private (`0700`), with private regular lock/state files. |
+| A tool call hangs or the client loses the connection | The server logs each call to stderr as `queued`, `start`, and `end` or `fail` lines with the tool name, duration, and process ID, never the arguments. In the client's MCP log, look for the last `start` without an `end`. Calls run one at a time, so anything queued behind a stuck call waits too. |
 | A previous write has an uncertain outcome | Follow the recovery procedure below. Restarting the server alone does not clear the block. |
 
 ### Recover after an uncertain write

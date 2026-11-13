@@ -824,7 +824,7 @@ test('global search never returns partial latest when an account fails or time e
   mail.accounts = collection([account]);
   let time = 0;
   t.mock.method(Date, 'now', () => time);
-  mail.mailboxes = () => { time = 20001; return []; };
+  mail.mailboxes = () => { time = 35001; return []; };
   assert.throws(() => dispatch(mail, 'search_messages', args), /latest match not established/);
 });
 

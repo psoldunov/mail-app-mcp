@@ -24,6 +24,7 @@ def extract_content(path: Path, mime: str) -> dict:
             result = subprocess.run(
                 [sys.executable, "-m", "mail_app_mcp.pdf_text", str(path)],
                 capture_output=True, text=True, timeout=10, shell=False,
+                stdin=subprocess.DEVNULL,  # Never share the MCP transport's stdin with a child.
                 # The Nix wrapper adds this package and pypdf to sys.path in-process only; the child needs them too.
                 env={**os.environ, "PYTHONPATH": os.pathsep.join(entry for entry in sys.path if entry)},
             )
