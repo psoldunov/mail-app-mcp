@@ -56,7 +56,7 @@ For a behavior change, test the public tool or external boundary that demonstrat
 
 ## Manual acceptance with a disposable account
 
-This checklist is opt-in and is not part of automated tests. Do it only when an operator is present and explicitly chooses to test live Mail. Development of this version did not exercise live Mail. Use disposable accounts and messages, with no queued or scheduled mail. Mail may connect to providers and sync changes during this procedure.
+This checklist is opt-in and is not part of automated tests. Do it only when an operator is present and explicitly chooses to test live Mail. The list, read, draft, reply, and show paths of this version were checked against Mail 16 on macOS 27.2 with a Gmail account; moves and Trash were not. Use disposable accounts and messages, with no queued or scheduled mail. Mail may connect to providers and sync changes during this procedure.
 
 Record the macOS version, Mail version, account backend, server commit, client launcher, and result for each check. Do not publish real addresses, message contents, or attachment data in test logs.
 

@@ -59,7 +59,7 @@ def test_read_timeout_identifies_operation_and_is_safe_to_retry(operation):
     assert not isinstance(error, OutcomeUnknown)
     assert error.operation == operation
     assert error.retry_safe is True
-    assert operation in str(error)
+    assert {"save_attachment": "read_attachment"}.get(operation, operation) in str(error)
     assert "retry_safe=true" in str(error)
     assert "timed out" in str(error)
     assert "write" not in str(error)
@@ -168,12 +168,40 @@ def test_launch_error_keeps_underlying_cause_and_read_retry_safety():
     'not json', '{"ok":true,"result":[]}', '{}', 'x' * 2_000_001,
     '{"ok":false,"error":"Outcome unknown: Draft may have been created"}',
 ])
-@pytest.mark.parametrize("operation", [None, "create_draft", "show_message", "show_draft"])
+@pytest.mark.parametrize("operation", [None, "create_draft", "show_draft"])
 def test_uncertain_decoder_errors_preserve_legacy_and_write_behavior(output, operation):
     with pytest.raises(OutcomeUnknown) as caught:
         decode_response(output, operation=operation)
     assert caught.value.retry_safe is False
     assert "Do not retry" in str(caught.value)
+
+
+@pytest.mark.parametrize("output", [
+    'not json', '{"ok":false,"error":"Outcome unknown: Window failed"}',
+])
+def test_showing_a_message_never_reports_an_uncertain_write(output):
+    with pytest.raises(BridgeError) as caught:
+        decode_response(output, operation="show_message")
+    assert not isinstance(caught.value, OutcomeUnknown)
+    assert caught.value.retry_safe is True
+    assert "Outcome unknown" not in str(caught.value)
+
+
+@pytest.mark.parametrize("operation", ["create_draft", "reply_draft", "set_message_status", "move_message"])
+def test_clean_write_rejections_are_safe_to_retry(operation):
+    output = json.dumps({"ok": False, "error": "Cannot reply to a saved draft"})
+    with pytest.raises(BridgeError) as caught:
+        decode_response(output, operation=operation)
+    assert not isinstance(caught.value, OutcomeUnknown)
+    assert caught.value.retry_safe is True
+    assert "retry_safe=true" in str(caught.value)
+
+
+def test_attachment_errors_name_the_public_tool():
+    with pytest.raises(BridgeError) as caught:
+        decode_response('{"ok":false,"error":"Attachment missing or ambiguous"}', operation="save_attachment")
+    assert str(caught.value).startswith("read_attachment: Attachment missing")
+    assert caught.value.operation == "save_attachment"
 
 
 @pytest.mark.parametrize("number", [None, "-1743", True, {"code": -1743}])

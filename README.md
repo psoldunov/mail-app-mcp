@@ -10,7 +10,7 @@ The first Mail tool call launches Mail hidden if it is closed. An already-runnin
 | --- | --- |
 | Discover and read | Discover accounts and nested mailboxes; search senders across accounts in received-date order; list or search one mailbox; read plain-text message content. |
 | Attachments | Read downloaded attachments up to 10 MiB. Extract bounded text/PDF content; return other files up to 1 MiB as base64. No OCR. |
-| Drafts and windows | Save new plain-text drafts and reply drafts using an explicit account sender; optionally show them in Mail. Show an identified message or available outgoing draft. No editing existing drafts or attaching local files. |
+| Drafts and windows | Save new plain-text drafts and reply drafts using an explicit account sender, and get back a reference to the saved copy; optionally show them in Mail. Show an identified message or saved draft. No editing existing drafts or attaching local files. |
 | Organize | Change read/flag status; move one message to an explicitly allowed mailbox in the same account. |
 | Trash | Move to the account's explicitly configured Trash mailbox. Mail or the provider may later purge it. |
 

@@ -5,7 +5,9 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const { dispatch } = require('../src/mail_app_mcp/mail.js');
 global.Automation = { getDisplayString: (value) => value.specifier };
+global.$ = { NSThread: { sleepForTimeInterval() {} } };
 let nextSpecifier = 0;
+const BULK = ['subject', 'id', 'dateReceived', 'sender', 'messageId', 'readStatus', 'flaggedStatus'];
 
 function collection(items) {
   const value = () => items.slice();
@@ -16,10 +18,8 @@ function collection(items) {
       ? item[key]().toLowerCase().includes(criteria[key]._contains.toLowerCase())
       : item[key]() === criteria[key])));
   value.slice = (start, end) => collection(items.slice(start, end + 1));
-  value.subject = () => items.map((item) => item.subject());
-  value.id = () => items.map((item) => item.id());
-  value.dateReceived = () => items.map((item) => item.dateReceived());
-  value.sender = () => items.map((item) => item.sender());
+  BULK.forEach((key) => { value[key] = () => items.map((item) => item[key]()); });
+  value.byId = (id) => items.find((item) => item.id() === id);
   value.push = (item) => { items.push(item); };
   return value;
 }
@@ -41,8 +41,9 @@ function fixture(count = 1) {
   const messages = Array.from({ length: count }, (_, i) => Object.assign(scripting({
     id: i + 1, messageId: `<${i + 1}@example.com>`, mailbox: inbox,
     subject: i === 200 ? 'Needle' : 'Hello [literal]', sender: 'other@example.com',
-    dateReceived: new Date('2026-01-02T03:04:05Z'), readStatus: false, flaggedStatus: false,
-    content: 'Body with secret', messageSize: 1000,
+    dateReceived: new Date('2026-01-02T03:04:05Z'), dateSent: new Date('2026-01-02T03:04:05Z'),
+    readStatus: false, flaggedStatus: false, content: 'Body with secret', messageSize: 1000,
+    allHeaders: 'To: me@example.com\nCc: Me Too <self@example.com>\n',
   }), { toRecipients: collection([scripting({ address: 'me@example.com' })]),
     ccRecipients: collection([]), mailAttachments: collection([]) }));
   for (const box of [inbox, archive, outbox, draftbox, sentbox]) {
@@ -99,17 +100,18 @@ test('local mailbox paths end at a nonexistent account without hiding automation
   assert.throws(() => dispatch(mail, 'list_mailboxes', { account_id: '__local__' }), /Automation denied/);
 });
 
-test('search references use the owning mailbox and reject a different account', () => {
+test('list references keep the listed label mailbox, and both label and storage refs read the message', () => {
   const { mail, archive, messages } = fixture();
   messages[0].mailbox = archive;
   archive.messages = collection(messages);
   const args = { account_id: 'a1', mailbox: ['Inbox'], offset: 0, limit: 20,
     query: 'hello', search_body: false };
-  const result = dispatch(mail, 'list_messages', args);
-  assert.deepEqual(result.messages[0].ref.mailbox, ['Archive']);
-  assert.equal(dispatch(mail, 'read_message', { ref: result.messages[0].ref, max_chars: 4 }).body, 'Body');
-  archive.account = scripting({ id: 'other-account' });
-  assert.throws(() => dispatch(mail, 'list_messages', args), /account.*changed/);
+  const listed = dispatch(mail, 'list_messages', args).messages[0].ref;
+  assert.deepEqual(listed.mailbox, ['Inbox']);
+  assert.equal(dispatch(mail, 'read_message', { ref: listed, max_chars: 4 }).body, 'Body');
+  assert.equal(dispatch(mail, 'read_message', { ref: { ...listed, mailbox: ['Archive'] }, max_chars: 4 }).body, 'Body');
+  assert.throws(() => dispatch(mail, 'read_message', { ref: { ...listed, mailbox: ['Localized sent'] }, max_chars: 4 }),
+    /missing/);
 });
 
 test('lists exact mailbox segment paths, including slashes, and rejects ambiguity', () => {
@@ -125,101 +127,110 @@ test('lists exact mailbox segment paths, including slashes, and rejects ambiguit
     offset: 0, limit: 10, query: '', search_body: false }), /ambiguous/i);
 });
 
-test('search scans at most 200 messages and resumes even when first page has no matches', () => {
-  const { mail } = fixture(201);
+test('header search covers the whole mailbox in one call and says why a page stopped', () => {
+  const { mail } = fixture(301);
   const args = { account_id: 'a1', mailbox: ['Inbox'], offset: 0, limit: 10,
     query: 'NEEDLE', search_body: false };
-  assert.deepEqual(dispatch(mail, 'list_messages', args),
-    { messages: [], next_offset: 200, complete: false, scanned: 200 });
-  const next = dispatch(mail, 'list_messages', { ...args, offset: 200 });
-  assert.equal(next.messages[0].ref.message_id, 201);
-  assert.equal(next.complete, true);
-  assert.equal(next.next_offset, null);
-  assert.equal(next.scanned, 1);
+  const result = dispatch(mail, 'list_messages', args);
+  assert.deepEqual(result.messages.map((m) => m.ref.message_id), [201]);
+  assert.deepEqual({ ...result, messages: undefined },
+    { messages: undefined, next_offset: null, complete: true, scanned: 301, stopped: 'end' });
+  const page = dispatch(mail, 'list_messages', { ...args, query: '', limit: 2, offset: 299 });
+  assert.deepEqual([page.next_offset, page.complete, page.stopped], [null, true, 'end']);
+  const limited = dispatch(mail, 'list_messages', { ...args, query: '', limit: 2 });
+  assert.deepEqual([limited.next_offset, limited.complete, limited.scanned, limited.stopped], [2, false, 2, 'limit']);
 });
 
-test('header search batches only its bounded scan window', () => {
-  const { mail, inbox, messages } = fixture(201);
+test('listing reads each header property once for the whole mailbox, never per message', () => {
+  const { mail, inbox, messages } = fixture(50);
   inbox.messages = collection(messages.map((message) => new Proxy(message, { get(target, key) {
-    if (['subject', 'sender', 'content'].includes(key)) assert.fail('Individual header or body was fetched');
+    if (key === 'content') assert.fail('Body was fetched');
     return target[key];
   } })));
-  const ranges = [];
-  inbox.messages.slice = (start, end) => {
-    ranges.push([start, end]);
-    return { subject: () => Array(10).fill('Other'), sender: () => Array(10).fill('other@example.com') };
-  };
-  assert.deepEqual(dispatch(mail, 'list_messages', { account_id: 'a1', mailbox: ['Inbox'],
-    offset: 0, limit: 20, query: 'needle', search_body: false }),
-  { messages: [], next_offset: 200, complete: false, scanned: 200 });
-  assert.equal(ranges.length, 20);
-  assert.deepEqual(ranges[0], [0, 9]);
-  assert.deepEqual(ranges[19], [190, 199]);
+  const calls = [];
+  for (const key of BULK) {
+    const bulk = inbox.messages[key];
+    inbox.messages[key] = () => { calls.push(key); return bulk(); };
+  }
+  inbox.messages.slice = () => assert.fail('Range reads cost one Apple event per message');
+  const result = dispatch(mail, 'list_messages', { account_id: 'a1', mailbox: ['Inbox'],
+    offset: 0, limit: 20, query: 'hello', search_body: false });
+  assert.equal(result.messages.length, 20);
+  assert.deepEqual(calls.sort(), [...BULK, 'id'].sort());
+  assert.deepEqual(Object.keys(result.messages[0]), ['ref', 'subject', 'sender', 'date_received', 'read', 'flagged']);
 });
 
-test('search returns a resumable page when Mail exhausts the time budget', (t) => {
+test('body search returns a resumable page when it exhausts the time budget', (t) => {
+  let now = 0;
+  t.mock.method(Date, 'now', () => now);
+  const { mail, inbox, messages } = fixture(3);
+  inbox.messages = collection(messages.map((message) => slowBody(message, () => { now += 6000; })));
+  const args = { account_id: 'a1', mailbox: ['Inbox'], offset: 0, limit: 20, query: 'absent', search_body: true };
+  const result = dispatch(mail, 'list_messages', args);
+  assert.deepEqual([result.scanned, result.next_offset, result.complete, result.stopped], [2, 2, false, 'time_budget']);
+  const next = dispatch(mail, 'list_messages', { ...args, offset: result.next_offset });
+  assert.deepEqual([next.scanned, next.next_offset, next.complete, next.stopped], [1, null, true, 'end']);
+});
+
+test('a slow snapshot still scans at least one message, so continuations always advance', (t) => {
   let now = 0;
   t.mock.method(Date, 'now', () => now);
   const { mail, inbox, messages } = fixture(2);
-  inbox.messages.slice = () => ({
-    subject: () => ['Hello [literal]', 'Hello [literal]'],
-    sender: () => { now = 10001; return ['other@example.com', 'other@example.com']; },
-  });
+  inbox.messages = collection(messages.map((message) => slowBody(message, () => { now += 60000; })));
+  const ids = inbox.messages.id;
+  inbox.messages.id = () => { now += 60000; return ids(); };
   const result = dispatch(mail, 'list_messages', { account_id: 'a1', mailbox: ['Inbox'],
-    offset: 0, limit: 20, query: '', search_body: false });
-  assert.equal(result.scanned, 1);
-  assert.equal(result.next_offset, 1);
-  assert.equal(result.complete, false);
-  assert.equal(result.messages[0].ref.message_id, messages[0].id());
-  inbox.messages = collection(messages);
-  const next = dispatch(mail, 'list_messages', { account_id: 'a1', mailbox: ['Inbox'],
-    offset: result.next_offset, limit: 20, query: '', search_body: false });
-  assert.equal(next.messages[0].ref.message_id, messages[1].id());
-  assert.equal(next.complete, true);
-  assert.equal(next.next_offset, null);
+    offset: 0, limit: 20, query: 'absent', search_body: true });
+  assert.deepEqual([result.scanned, result.next_offset], [1, 1]);
 });
 
-test('search handles exhausted pages and rejects incomplete header batches', () => {
-  const { mail, inbox } = fixture();
-  inbox.messages.slice = () => assert.fail('Read beyond the last message');
-  const args = { account_id: 'a1', mailbox: ['Inbox'], offset: 1, limit: 20, query: '', search_body: false };
+function slowBody(message, tick) {
+  return new Proxy(message, { get(target, key) {
+    if (key === 'content') return () => { tick(); return 'no match'; };
+    return target[key];
+  } });
+}
+
+test('listing handles exhausted pages and rejects snapshots that change while reading', () => {
+  const { mail, inbox, messages } = fixture(2);
+  const args = { account_id: 'a1', mailbox: ['Inbox'], offset: 5, limit: 20, query: '', search_body: false };
   assert.deepEqual(dispatch(mail, 'list_messages', args),
-    { messages: [], next_offset: null, complete: true, scanned: 0 });
-  inbox.messages.slice = () => ({ subject: () => [], sender: () => ['other@example.com'] });
+    { messages: [], next_offset: null, complete: true, scanned: 0, stopped: 'end' });
+  inbox.messages.sender = () => ['other@example.com'];
+  assert.throws(() => dispatch(mail, 'list_messages', { ...args, offset: 0 }), /Mailbox changed/);
+  inbox.messages = collection(messages);
+  let reads = 0;
+  inbox.messages.id = () => (++reads === 1 ? [1, 2] : [3, 1]);
+  assert.throws(() => dispatch(mail, 'list_messages', { ...args, offset: 0 }), /Mailbox changed/);
+  inbox.messages = collection(messages);
+  inbox.messages.subject = () => [null, 'Hello'];
   assert.throws(() => dispatch(mail, 'list_messages', { ...args, offset: 0 }), /Mailbox changed/);
 });
 
-test('slow mailbox lookup fails instead of returning a nonadvancing continuation', (t) => {
-  let now = 0;
-  t.mock.method(Date, 'now', () => now);
-  const { mail, account } = fixture();
-  const boxes = account.mailboxes();
-  account.mailboxes = () => { now += 10001; return boxes; };
-  assert.throws(() => dispatch(mail, 'list_messages', { account_id: 'a1', mailbox: ['Inbox'],
-    offset: 0, limit: 20, query: '', search_body: false }), /too long/);
-});
-
-test('search rejects reordered messages rather than returning a nonmatching result', () => {
-  const { mail, inbox, messages } = fixture(2);
-  messages[1].subject = 'Unrelated';
-  inbox.messages.slice = () => ({ subject: () => ['Needle', 'Unrelated'], sender: () => {
-    inbox.messages[0] = messages[1];
-    return ['other@example.com', 'other@example.com'];
-  } });
-  assert.throws(() => dispatch(mail, 'list_messages', { account_id: 'a1', mailbox: ['Inbox'],
-    offset: 0, limit: 20, query: 'needle', search_body: false }), /Mailbox changed/);
-});
-
 test('reads bounded body only after exact reference validation', () => {
-  const { mail, ref, messages } = fixture();
+  const { mail, ref, inbox, messages } = fixture();
   const result = dispatch(mail, 'read_message', { ref, max_chars: 4 });
   assert.equal(result.body, 'Body');
   assert.equal(result.truncated, true);
   assert.deepEqual(result.to, ['me@example.com']);
+  assert.match(result.headers, /^Cc: Me Too <self@example.com>$/m);
   assert.throws(() => dispatch(mail, 'read_message', {
     ref: { ...ref, header_message_id: '<stale>' }, max_chars: 4 }), /stale/i);
-  messages[0].mailbox = fixture().archive;
-  assert.throws(() => dispatch(mail, 'read_message', { ref, max_chars: 4 }), /mailbox|stale/i);
+  inbox.messages = collection([]);
+  assert.throws(() => dispatch(mail, 'read_message', { ref, max_chars: 4 }), /missing/i);
+  assert.equal(messages[0].readStatus(), false);
+});
+
+test('a failing header getter keeps reads working with Mail recipients only', () => {
+  for (const [number, works] of [[-10000, true], [-1743, false]]) {
+    const { mail, ref, inbox, messages } = fixture();
+    inbox.messages = collection([new Proxy(messages[0], { get(target, key) {
+      if (key === 'allHeaders') return () => { throw Object.assign(new Error('Handler failed'), { errorNumber: number }); };
+      return target[key];
+    } })]);
+    if (works) assert.equal(dispatch(mail, 'read_message', { ref, max_chars: 4 }).headers, '');
+    else assert.throws(() => dispatch(mail, 'read_message', { ref, max_chars: 4 }), /Handler failed/);
+  }
 });
 
 test('listed messages with an empty Message-ID can be read using their exact reference', () => {
@@ -251,7 +262,7 @@ test('status updates verify identity and reject Outbox source before writing', (
 });
 
 test('moves within account and rejects resolved special destinations and stale source', () => {
-  const { mail, ref, messages } = fixture();
+  const { mail, ref, inbox, messages } = fixture();
   for (const name of ['Localized outgoing', 'Localized drafts', 'Localized sent']) {
     assert.throws(() => dispatch(mail, 'move_message', { ref, destination: [name] }), /unsafe/i);
     assert.equal(messages[0].mailbox().name(), 'Inbox');
@@ -259,7 +270,8 @@ test('moves within account and rejects resolved special destinations and stale s
   assert.deepEqual(dispatch(mail, 'move_message', { ref, destination: ['Archive'] }),
     { account_id: 'a1', destination: ['Archive'], moved: true });
   assert.equal(messages[0].mailbox().name(), 'Archive');
-  assert.throws(() => dispatch(mail, 'move_message', { ref, destination: ['Inbox'] }), /stale/i);
+  inbox.messages = collection([]);
+  assert.throws(() => dispatch(mail, 'move_message', { ref, destination: ['Inbox'] }), /missing/i);
 });
 
 test('attachment saves reject absent, unavailable and oversize attachments before saving', () => {
@@ -284,18 +296,30 @@ test('attachment saves reject absent, unavailable and oversize attachments befor
   delete global.Path;
 });
 
-function composing(mail) {
+// Saving an outgoing message makes Mail write a copy, with its signature, into Drafts.
+function composing(mail, { copy = true } = {}) {
   const saved = [];
   const drafts = [];
+  const draftbox = mail.draftsMailbox();
+  let nextId = 900;
   mail.outgoingMessages = collection(drafts);
-  mail.OutgoingMessage = (properties) => Object.assign(scripting({ id: 42, ...properties }), {
+  mail.OutgoingMessage = (properties) => Object.assign(scripting({ id: 42, subject: '', visible: true, ...properties }), {
     toRecipients: collection([]), ccRecipients: collection([]), bccRecipients: collection([]),
   });
   mail.ToRecipient = mail.CcRecipient = mail.BccRecipient = (properties) => scripting(properties);
-  mail.save = (draft) => { saved.push(draft); };
+  mail.save = (draft) => {
+    saved.push(draft);
+    if (!copy) return;
+    nextId += 1;
+    draftbox.messages = collection(draftbox.messages().concat([scripting({ id: nextId,
+      messageId: `<draft-${nextId}@example.com>`, mailbox: draftbox, subject: draft.subject(),
+      content: `\n${draft.content()} \n\n--\nSignature` })]));
+  };
   mail.send = () => assert.fail('must never send');
   mail.activate = () => assert.fail('must not activate without an explicit window request');
-  return { saved, drafts };
+  mail.open = () => assert.fail('must not open a window without an explicit request');
+  return { saved, drafts, savedRef: (id) => ({ account_id: 'a1', mailbox: ['Localized drafts'], message_id: id,
+    header_message_id: `<draft-${id}@example.com>` }) };
 }
 
 test('unavailable MIME metadata preserves message reads and bounded attachment export with a warning', () => {
@@ -324,40 +348,50 @@ test('unavailable MIME metadata preserves message reads and bounded attachment e
   }
 });
 
-test('zero outgoing IDs can be saved, replied and shown without accepting ambiguous drafts', () => {
-  const { mail, ref } = fixture();
-  const { saved, drafts } = composing(mail);
-  const make = mail.OutgoingMessage;
-  mail.OutgoingMessage = (properties) => { const draft = make(properties); draft.id = 0; return draft; };
-  const args = { account_id: 'a1', sender: 'me@example.com', to: ['you@example.com'],
-    cc: [], bcc: [], subject: 'Test', body: 'Body' };
-  assert.equal(dispatch(mail, 'create_draft', args).draft_id, 0);
-  assert.equal(saved.length, 1);
-  mail.activate = () => {};
-  const show = { account_id: 'a1', sender: args.sender, draft_id: 0 };
-  assert.equal(dispatch(mail, 'show_draft', show).shown, true);
-  mail.reply = () => mail.OutgoingMessage({ content: 'Quote', sender: args.sender });
-  assert.equal(dispatch(mail, 'reply_draft', { ref, sender: args.sender, body: 'Reply', reply_all: false }).draft_id, 0);
-  mail.outgoingMessages = collection([drafts[0], drafts[0]]);
-  assert.throws(() => dispatch(mail, 'show_draft', show), /ambiguous/);
-  assert.throws(() => dispatch(mail, 'show_draft', { ...show, draft_id: -1 }), /Invalid/);
+test('show_draft is gone: saved drafts are shown by their ref through show_message', () => {
+  const mail = new Proxy({}, { get() { assert.fail('Mail was touched'); } });
+  assert.throws(() => dispatch(mail, 'show_draft', { account_id: 'a1', draft_id: 0, sender: 'me@example.com' }),
+    /Unsupported operation/);
 });
 
-test('creates and saves only a draft using an explicit account sender', () => {
+test('creates and saves only a draft using an explicit account sender, and returns its saved copy', () => {
   const { mail } = fixture();
-  const { saved, drafts } = composing(mail);
+  const { saved, drafts, savedRef } = composing(mail);
   const args = { account_id: 'a1', sender: 'me@example.com', to: ['you@example.com'],
-    cc: ['cc@example.com'], bcc: ['bcc@example.com'], subject: 'Subject', body: '<literal text>' };
+    cc: ['cc@example.com'], bcc: ['bcc@example.com'], subject: 'Subject', body: '<literal text>\nsecond  line' };
   assert.throws(() => dispatch(mail, 'create_draft', { ...args, sender: 'imposter@example.com' }), /sender/i);
   assert.throws(() => dispatch(mail, 'create_draft', { ...args, account_id: '__local__' }), /local/i);
   assert.equal(drafts.length, 0);
   assert.deepEqual(dispatch(mail, 'create_draft', args),
-    { draft_id: 42, account_id: 'a1', sender: 'me@example.com', status: 'draft' });
+    { status: 'draft', account_id: 'a1', sender: 'me@example.com', ref: savedRef(901) });
   assert.equal(saved.length, 1);
   assert.equal(saved[0], drafts[0]);
-  assert.equal(saved[0].content(), '<literal text>');
+  assert.equal(saved[0].content(), '<literal text>\nsecond  line');
   assert.equal(saved[0].visible(), false);
   assert.equal(saved[0].bccRecipients()[0].address(), 'bcc@example.com');
+});
+
+test('a saved copy that is slow to appear is a warned success, not an uncertain write', (t) => {
+  let now = 0;
+  t.mock.method(Date, 'now', () => (now += 1000));
+  const { mail } = fixture();
+  const { saved } = composing(mail, { copy: false });
+  const result = dispatch(mail, 'create_draft', { account_id: 'a1', sender: 'me@example.com', to: ['you@example.com'],
+    cc: [], bcc: [], subject: 'Slow', body: 'Body', open_window: true });
+  assert.equal(saved.length, 1);
+  assert.equal(result.ref, null);
+  assert.match(result.warning, /did not appear.*no window was opened.*Do not retry/);
+});
+
+test('a saved copy without the requested body reports an unknown outcome', (t) => {
+  let now = 0;
+  t.mock.method(Date, 'now', () => (now += 1000));
+  const { mail, draftbox } = fixture();
+  composing(mail);
+  const save = mail.save;
+  mail.save = (draft) => { save(draft); draftbox.messages()[0].content = '\n--\nSignature only'; };
+  assert.throws(() => dispatch(mail, 'create_draft', { account_id: 'a1', sender: 'me@example.com', to: ['you@example.com'],
+    cc: [], bcc: [], subject: 'Lost', body: 'Body' }), /^Error: Outcome unknown:.*without the requested body/);
 });
 
 test('expired references explain rediscovery after draft autosave without reading another message', () => {
@@ -387,23 +421,40 @@ test('reply rejects saved drafts, including canonical All Mail references, befor
   }
 });
 
-test('native reply preserves original content and saves without sending', () => {
+test('native reply hides its window before writing the body, quotes the original and saves without sending', () => {
   const { mail, ref, messages } = fixture();
-  const { saved } = composing(mail);
+  const { saved, savedRef } = composing(mail);
+  messages[0].content = 'Line one\nLine two ￼';
+  const events = [];
   let replies = 0;
   mail.reply = (message, options) => {
     assert.equal(message, messages[0]);
     assert.deepEqual(options, { openingWindow: false, replyToAll: true });
     replies += 1;
-    return mail.OutgoingMessage({ content: 'Original reply content', sender: 'wrong@example.com' });
+    // Mail opens a visible window anyway; its view would autosave over scripted content.
+    const draft = mail.OutgoingMessage({ subject: 'Re: Hello', content: '', sender: 'wrong@example.com' });
+    return new Proxy(draft, { set(target, key, value) {
+      events.push([key, key === 'content' ? 'body' : value]);
+      target[key] = value;
+      return true;
+    } });
   };
   const args = { ref, sender: 'me@example.com', body: 'My reply', reply_all: true };
   assert.throws(() => dispatch(mail, 'reply_draft', { ...args, sender: 'wrong@example.com' }), /sender/i);
   assert.equal(replies, 0);
   assert.deepEqual(dispatch(mail, 'reply_draft', args),
-    { draft_id: 42, account_id: 'a1', sender: 'me@example.com', status: 'draft' });
-  assert.equal(saved[0].content(), 'My reply\n\nOriginal reply content');
-  assert.equal(saved[0].sender(), 'me@example.com');
+    { status: 'draft', account_id: 'a1', sender: 'me@example.com', ref: savedRef(901) });
+  assert.deepEqual(events, [['visible', false], ['sender', 'me@example.com'], ['content', 'body']]);
+  assert.match(saved[0].content(), /^My reply\n\nOn .+, other@example.com wrote:\n\n> Line one\n> Line two $/);
+});
+
+test('reply quotes are bounded for very long originals', () => {
+  const { mail, ref, messages } = fixture();
+  const { saved } = composing(mail);
+  messages[0].content = 'x'.repeat(100001);
+  mail.reply = () => mail.OutgoingMessage({ subject: 'Re: Hello', content: '', sender: 'me@example.com' });
+  dispatch(mail, 'reply_draft', { ref, sender: 'me@example.com', body: 'Short', reply_all: false });
+  assert.match(saved[0].content(), /^Short\n\nOn .+ wrote:\n\n> x{100000}\n> \[…\]$/);
 });
 
 test('draft membership is account-scoped and a failed lookup cannot create a reply', () => {
@@ -649,20 +700,19 @@ test('oversized or unknown message sizes cannot fetch bodies or create reply quo
   }
 });
 
-test('explicit create and reply windows activate only after saving their draft', () => {
-  const { mail, ref } = fixture();
+test('explicit create and reply windows open the saved copy, since hidden compose windows cannot be reshown', () => {
+  const { mail, ref, draftbox } = fixture();
   const { saved } = composing(mail);
-  let activations = 0;
-  mail.activate = () => {
-    assert.equal(saved.length, activations + 1);
-    assert.equal(saved[activations].visible(), true);
-    activations += 1;
-  };
+  const events = [];
+  mail.open = (message) => events.push(['open', message.id(), saved.length]);
+  mail.activate = () => events.push(['activate']);
   dispatch(mail, 'create_draft', { account_id: 'a1', sender: 'me@example.com',
     to: ['you@example.com'], cc: [], bcc: [], subject: '', body: '', open_window: true });
-  mail.reply = () => mail.OutgoingMessage({ sender: 'me@example.com', content: 'original', visible: false });
+  mail.reply = () => mail.OutgoingMessage({ sender: 'me@example.com', content: 'original' });
   dispatch(mail, 'reply_draft', { ref, sender: 'me@example.com', body: 'reply', reply_all: false, open_window: true });
-  assert.equal(activations, 2);
+  assert.deepEqual(events, [['open', 901, 1], ['activate'], ['open', 902, 2], ['activate']]);
+  assert.deepEqual(saved.map((draft) => draft.visible()), [false, false]);
+  assert.equal(draftbox.messages().length, 2);
 });
 
 test('show_message opens only the resolved message and rejects stale references', () => {
@@ -674,21 +724,6 @@ test('show_message opens only the resolved message and rejects stale references'
   assert.deepEqual(events, []);
   assert.deepEqual(dispatch(mail, 'show_message', { ref }), { shown: true });
   assert.deepEqual(events, ['open', 'activate']);
-});
-
-test('show_draft validates account, draft ID and sender before showing a specific draft', () => {
-  const { mail } = fixture();
-  const { drafts } = composing(mail);
-  dispatch(mail, 'create_draft', { account_id: 'a1', sender: 'me@example.com',
-    to: ['you@example.com'], cc: [], bcc: [], subject: '', body: '' });
-  let activations = 0;
-  mail.activate = () => { assert.equal(drafts[0].visible(), true); activations += 1; };
-  const args = { account_id: 'a1', draft_id: 42, sender: 'me@example.com' };
-  assert.throws(() => dispatch(mail, 'show_draft', { ...args, sender: 'wrong@example.com' }), /Sender/);
-  assert.throws(() => dispatch(mail, 'show_draft', { ...args, draft_id: 43 }), /missing/);
-  assert.equal(activations, 0);
-  assert.deepEqual(dispatch(mail, 'show_draft', args), { shown: true, draft_id: 42, account_id: 'a1' });
-  assert.equal(activations, 1);
 });
 
 test('global sender search orders all accounts before applying the limit', () => {

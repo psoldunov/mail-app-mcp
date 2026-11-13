@@ -131,7 +131,7 @@ Use actual absolute paths; do not rely on shell expansion of `~`. Starting the e
 | Destination or Trash is not configured | Denied moves list that account's configured destinations. Rediscover mailbox paths, update the owner-controlled policy, then restart the server. Sending mailbox restrictions still apply. |
 | Missing, stale, or ambiguous reference | List the source mailbox again and use the newly returned `ref`. Draft autosave can change both IDs; moves and external changes can also invalidate references. |
 | Cannot reply to a saved draft | Select a received message, or use `create_draft` for a new standalone draft. Saved drafts cannot be reply sources. |
-| Outgoing draft is no longer available | A `draft_id` can become stale after its window closes or Mail restarts. Locate it manually in Mail; do not create another draft just to show it. |
+| A draft call returned `ref: null` with a warning | Mail saved the draft, but its copy did not reach Drafts within 30 seconds. List the Drafts mailbox to find it; do not create another draft. |
 | Message size is unknown or exceeds 20 MiB | Use subject/sender search with `search_body: false`, or read/reply manually in Mail. Reducing `max_chars` does not bypass the source-size guard. |
 | Attachment is not downloaded | Download it in Mail manually before calling `read_attachment`. |
 | Attachment exceeds a limit or PDF extraction fails | Open it yourself in a suitable application. The server does not execute attachments, OCR images, or bypass limits. |
@@ -140,10 +140,10 @@ Use actual absolute paths; do not rely on shell expansion of `~`. Starting the e
 
 ### Recover after an uncertain write
 
-Both the initial uncertain-write error and later blocked-write errors include the exact marker path and these recovery steps. A blocked call attempts no new write. The existing marker is never cleared automatically.
+Both the initial uncertain-write error and later blocked-write errors include the exact marker path, the marker's contents, and these recovery steps. The marker is JSON naming the operation, its target (message reference, or account and subject for a new draft), when it started, the server's process ID, and the server build that wrote it. A marker left by a build older than this one is empty, and the error says it has no details. A blocked call attempts no new write. The existing marker is never cleared automatically. All server processes share one marker, so a marker left by any build blocks writes in all of them.
 
-1. Stop all MCP clients' `mail-app-mcp` processes to prevent new operations. Inspect Mail for the attempted change. A timeout does not mean that Mail canceled the Apple event; allow it to finish and reconcile the actual message or draft state.
-2. When you have established the outcome, remove only the marker `~/Library/Caches/mail-app-mcp/write-uncertain`. Do not remove the shared `writes.lock` file. No MCP tool clears this marker.
-3. Restart your server, rediscover affected messages, and decide whether a new write is needed. Never replay a draft creation blindly: it can create duplicates.
+1. Inspect Mail for the attempted change, using the target in the marker. A timeout does not mean that Mail canceled the Apple event; allow it to finish and reconcile the actual message or draft state.
+2. When you have established the outcome, run `mail-app-mcp --clear-uncertain`. It waits for any write in progress, prints what the marker recorded, removes only the marker, and exits. It does not need the server stopped. Removing `~/Library/Caches/mail-app-mcp/write-uncertain` by hand also works; never remove the shared `writes.lock` file. No MCP tool clears this marker.
+3. Rediscover affected messages and decide whether a new write is needed. Never replay a draft creation blindly: it can create duplicates.
 
-If you cannot establish the outcome, leave the marker in place and investigate manually. Read tools remain available while writes are blocked.
+If you cannot establish the outcome, leave the marker in place and investigate manually. Read tools and `show_message` remain available while writes are blocked.

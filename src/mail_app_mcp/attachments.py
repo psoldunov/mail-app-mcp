@@ -2,6 +2,7 @@
 
 import base64
 import json
+import mimetypes
 import os
 from pathlib import Path
 import stat
@@ -40,14 +41,23 @@ def extract_content(path: Path, mime: str) -> dict:
     return {"base64": base64.b64encode(path.read_bytes()).decode("ascii"), "encoding": "base64"}
 
 
+def guessed_mime(metadata: dict) -> dict:
+    """Mail's MIME lookup can fail with -10000 (it then reports a warning); fall back to the file name."""
+    guess = mimetypes.guess_type(str(metadata.get("name", "")))[0]
+    if metadata.get("mime_type") != "application/octet-stream" or "warning" not in metadata or guess is None:
+        return metadata
+    return {**metadata, "mime_type": guess,
+            "warning": "Mail did not report a MIME type; it was guessed from the untrusted file name."}
+
+
 def read_attachment_content(bridge, directory: Path, ref: MessageRef, attachment_id: str) -> dict:
     private_directory(directory)
     with tempfile.TemporaryDirectory(prefix="attachment-", dir=directory) as temporary:
         path = Path(temporary) / "content"
-        metadata = bridge.call("save_attachment", {
+        metadata = guessed_mime(bridge.call("save_attachment", {
             "ref": ref.model_dump(mode="json"), "attachment_id": attachment_id,
             "path": str(path), "max_bytes": MAX_BYTES,
-        })
+        }))
         info = path.lstat()
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != os.getuid():
             raise ValueError("Mail export is not a safe regular file")
