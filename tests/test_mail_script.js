@@ -298,11 +298,13 @@ test('attachment saves reject absent, unavailable and oversize attachments befor
   delete global.Path;
 });
 
-// Saving an outgoing message makes Mail write a copy, with its signature, into Drafts.
+// Saving an outgoing message makes Mail write a copy, with its signature, into Drafts. Saving the same
+// outgoing message again replaces that copy under a new ID, as Mail does.
 function composing(mail, { copy = true } = {}) {
   const saved = [];
   const drafts = [];
   const draftbox = mail.draftsMailbox();
+  const copies = new Map();
   let nextId = 900;
   mail.outgoingMessages = collection(drafts);
   mail.OutgoingMessage = (properties) => Object.assign(scripting({ id: 42, subject: '', visible: true, ...properties }), {
@@ -310,12 +312,14 @@ function composing(mail, { copy = true } = {}) {
   });
   mail.ToRecipient = mail.CcRecipient = mail.BccRecipient = (properties) => scripting(properties);
   mail.save = (draft) => {
-    saved.push(draft);
+    if (!saved.includes(draft)) saved.push(draft);
     if (!copy) return;
     nextId += 1;
-    draftbox.messages = collection(draftbox.messages().concat([scripting({ id: nextId,
-      messageId: `<draft-${nextId}@example.com>`, mailbox: draftbox, subject: draft.subject(),
-      content: `\n${draft.content()} \n\n--\nSignature` })]));
+    const previous = copies.get(draft);
+    copies.set(draft, nextId);
+    draftbox.messages = collection(draftbox.messages().filter((message) => message.id() !== previous)
+      .concat([scripting({ id: nextId, messageId: `<draft-${nextId}@example.com>`, mailbox: draftbox,
+        subject: draft.subject(), content: `\n${draft.content()} \n\n--\nSignature` })]));
   };
   mail.send = () => assert.fail('must never send');
   mail.activate = () => assert.fail('must not activate without an explicit window request');
@@ -365,7 +369,7 @@ test('creates and saves only a draft using an explicit account sender, and retur
   assert.throws(() => dispatch(mail, 'create_draft', { ...args, account_id: '__local__' }), /local/i);
   assert.equal(drafts.length, 0);
   assert.deepEqual(dispatch(mail, 'create_draft', args),
-    { status: 'draft', account_id: 'a1', sender: 'me@example.com', ref: savedRef(901) });
+    { status: 'draft', account_id: 'a1', sender: 'me@example.com', ref: savedRef(902) });
   assert.equal(saved.length, 1);
   assert.equal(saved[0], drafts[0]);
   assert.equal(saved[0].content(), '<literal text>\nsecond  line');
@@ -393,7 +397,7 @@ test('a saved draft that Mail cannot open is a warned success, not an uncertain 
   mail.reply = () => mail.OutgoingMessage({ subject: 'Re: Hello', content: '', sender: 'me@example.com' });
   const result = dispatch(mail, 'reply_draft', { ref, sender: 'me@example.com', body: 'Reply', reply_all: true,
     open_window: true });
-  assert.deepEqual(result.ref, savedRef(901));
+  assert.deepEqual(result.ref, savedRef(902));
   assert.match(result.warning, /could not open it: Can't get object.*show_message/);
 });
 
@@ -411,8 +415,77 @@ test('a copy Mail deletes while it is being checked is skipped, not reported as 
   };
   const result = dispatch(mail, 'create_draft', { account_id: 'a1', sender: 'me@example.com', to: ['you@example.com'],
     cc: [], bcc: [], subject: 'Race', body: 'Body' });
+  assert.deepEqual(result.ref, savedRef(902));
+  assert.equal(result.warning, undefined);
+});
+
+test('a draft is saved again once its first copy appears, so Mail has nothing left to re-save later', () => {
+  const { mail, draftbox } = fixture();
+  const { savedRef } = composing(mail);
+  const save = mail.save;
+  const copiesAtSave = [];
+  mail.save = (draft) => { copiesAtSave.push(draftbox.messages().length); save(draft); };
+  const result = dispatch(mail, 'create_draft', { account_id: 'a1', sender: 'me@example.com', to: ['you@example.com'],
+    cc: [], bcc: [], subject: 'Twice', body: 'Body' });
+  assert.deepEqual(copiesAtSave, [0, 1]);
+  assert.deepEqual(result.ref, savedRef(902));
+  assert.equal(draftbox.messages().length, 1);
+});
+
+test('a slow second save never returns the first copy that it is about to replace', () => {
+  const { mail, draftbox } = fixture();
+  const { savedRef } = composing(mail);
+  const save = mail.save;
+  let saves = 0;
+  mail.save = (draft) => {
+    if (++saves < 2) { save(draft); return; }
+    const [first] = draftbox.messages();
+    const second = scripting({ id: 905, messageId: '<draft-905@example.com>', mailbox: draftbox,
+      subject: first.subject(), content: first.content() });
+    let reads = 0;
+    // Mail keeps the first copy for more polls than the settle count before writing the second one.
+    Object.defineProperty(draftbox, 'messages', { configurable: true,
+      get: () => collection(++reads > 16 ? [second] : [first]) });
+  };
+  const result = dispatch(mail, 'create_draft', { account_id: 'a1', sender: 'me@example.com', to: ['you@example.com'],
+    cc: [], bcc: [], subject: 'Slow', body: 'Body' });
+  assert.deepEqual(result.ref, savedRef(905));
+});
+
+test('if the second save writes no newer copy in time, the first copy is still returned', (t) => {
+  let now = 0;
+  t.mock.method(Date, 'now', () => (now += 500));
+  const { mail } = fixture();
+  const { savedRef } = composing(mail);
+  const save = mail.save;
+  let saves = 0;
+  mail.save = (draft) => { if (++saves < 2) save(draft); };
+  const result = dispatch(mail, 'create_draft', { account_id: 'a1', sender: 'me@example.com', to: ['you@example.com'],
+    cc: [], bcc: [], subject: 'Noop', body: 'Body' });
   assert.deepEqual(result.ref, savedRef(901));
   assert.equal(result.warning, undefined);
+});
+
+test('a copy that Mail replaces right after the second save is followed to the newest one', () => {
+  const { mail, draftbox } = fixture();
+  const { savedRef } = composing(mail);
+  const save = mail.save;
+  let saves = 0;
+  mail.save = (draft) => {
+    save(draft);
+    if (++saves < 2) return;
+    const [first] = draftbox.messages();
+    const second = scripting({ id: 903, messageId: '<draft-903@example.com>', mailbox: draftbox,
+      subject: first.subject(), content: first.content() });
+    const before = collection([first]);
+    const after = collection([second]);
+    let reads = 0;
+    // Each poll reads the Drafts collection twice; Mail swaps the copy after three polls.
+    Object.defineProperty(draftbox, 'messages', { configurable: true, get: () => (++reads > 6 ? after : before) });
+  };
+  const result = dispatch(mail, 'create_draft', { account_id: 'a1', sender: 'me@example.com', to: ['you@example.com'],
+    cc: [], bcc: [], subject: 'Settle', body: 'Body' });
+  assert.deepEqual(result.ref, savedRef(903));
 });
 
 test('a saved copy without the requested body reports an unknown outcome', (t) => {
@@ -475,7 +548,7 @@ test('native reply hides its window before writing the body, quotes the original
   assert.throws(() => dispatch(mail, 'reply_draft', { ...args, sender: 'wrong@example.com' }), /sender/i);
   assert.equal(replies, 0);
   assert.deepEqual(dispatch(mail, 'reply_draft', args),
-    { status: 'draft', account_id: 'a1', sender: 'me@example.com', ref: savedRef(901) });
+    { status: 'draft', account_id: 'a1', sender: 'me@example.com', ref: savedRef(902) });
   assert.deepEqual(events, [['visible', false], ['sender', 'me@example.com'], ['content', 'body']]);
   assert.match(saved[0].content(), /^My reply\n\nOn .+, other@example.com wrote:\n\n> Line one\n> Line two $/);
 });
@@ -742,7 +815,7 @@ test('explicit create and reply windows open the saved copy, since hidden compos
     to: ['you@example.com'], cc: [], bcc: [], subject: '', body: '', open_window: true });
   mail.reply = () => mail.OutgoingMessage({ sender: 'me@example.com', content: 'original' });
   dispatch(mail, 'reply_draft', { ref, sender: 'me@example.com', body: 'reply', reply_all: false, open_window: true });
-  assert.deepEqual(events, [['open', 901, 1], ['activate'], ['open', 902, 2], ['activate']]);
+  assert.deepEqual(events, [['open', 902, 1], ['activate'], ['open', 904, 2], ['activate']]);
   assert.deepEqual(saved.map((draft) => draft.visible()), [false, false]);
   assert.equal(draftbox.messages().length, 2);
 });
@@ -855,6 +928,14 @@ test('an empty mailbox that rejects bulk reads counts as empty; a nonempty one s
   archive.messages = notes(3);
   assert.throws(() => dispatch(mail, 'search_messages', { from: '', sort: 'newest', limit: 5, account_id: 'a1',
     mailbox: null }), /Can't get object/);
+});
+
+test('a received-time tie puts the higher Mail ID first for newest and last for oldest', () => {
+  const { mail } = fixture(2);
+  const ids = (sort) => dispatch(mail, 'search_messages', { from: '', sort, limit: 5, account_id: 'a1', mailbox: null })
+    .messages.map((message) => message.ref.message_id);
+  assert.deepEqual(ids('newest'), [2, 1]);
+  assert.deepEqual(ids('oldest'), [1, 2]);
 });
 
 test('search refs prefer the INBOX label over the All Mail copy of the same message', () => {

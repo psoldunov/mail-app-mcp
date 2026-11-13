@@ -22,7 +22,7 @@ WRITE_OPERATIONS = frozenset({"create_draft", "reply_draft", "set_message_status
 OPERATIONS = READ_OPERATIONS | UI_OPERATIONS | WRITE_OPERATIONS
 PUBLIC_NAMES = {"save_attachment": "read_attachment"}
 MAX_RESPONSE = 2_000_000
-TIMEOUT_SECONDS = 45  # Drafts wait up to 30 s for Mail's saved copy after the source lookup.
+TIMEOUT_SECONDS = 60  # Drafts wait up to 30 s for Mail's saved copy, after lookups that slow down while Mail is busy.
 MAX_ERROR_DETAIL = 1000
 
 
