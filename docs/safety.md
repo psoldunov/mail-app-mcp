@@ -10,13 +10,13 @@ All Mail accounts are discoverable and readable. Move allowlists do not restrict
 
 ## Writes
 
-Existing-message operations require the complete account ID, mailbox segment array, Mail message ID, and header Message-ID. The bridge resolves the message in that account and mailbox and checks the identifiers before acting. Display names and a Message-ID header alone are insufficient. A stale or ambiguous reference fails; re-list after a move.
+Existing-message operations require the complete account ID, mailbox segment array, Mail message ID, and header Message-ID. The bridge resolves the message in that account and mailbox and checks the identifiers before acting. The mailbox can be any one that lists the message, such as a Gmail label stored in All Mail. Display names and a Message-ID header alone are insufficient. A stale or ambiguous reference fails; re-list after a move.
 
 Moves remain in the source account. The owner authorizes exact destination paths in startup configuration, including an explicit Trash mapping. There is no policy-editing tool and no guessed Trash name. Known sending mailboxes and resolved special destination mailboxes are rejected. The owner must still confirm each configured mailbox's role, including provider-specific or localized folders.
 
 Drafts require a sender advertised by the selected account and reject an address shared by multiple accounts. Replies use the source message's account and an explicit sender. Both operations create new drafts; they cannot send, edit an existing draft, or attach local files. Mail may sync drafts to a server, and a human can send them from Mail later.
 
-A per-user file lock serializes this server's writes across processes. Mail's UI, rules, synchronization, and other automation do not honor that lock. Uncertain write outcomes leave a persistent marker that blocks subsequent writes until the owner inspects Mail and clears it manually. See [recovery](setup.md#recover-after-an-uncertain-write). There is no automatic retry or rollback.
+A per-user file lock serializes this server's writes and `show_message` across processes. Mail's UI, rules, synchronization, and other automation do not honor that lock. Uncertain write outcomes leave a persistent marker, recording what was attempted, that blocks subsequent writes until the owner inspects Mail and runs `mail-app-mcp --clear-uncertain`. See [recovery](setup.md#recover-after-an-uncertain-write). There is no automatic retry or rollback.
 
 Trash is a move, with no permanent-delete or empty-Trash operation. Provider retention, Mail settings, or another application can purge it later. Do not use Trash as a backup.
 

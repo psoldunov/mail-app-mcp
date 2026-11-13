@@ -28,7 +28,8 @@ class FixtureMail:
         if self.fail_write:
             raise OutcomeUnknown("Do not retry")
         if operation == "create_draft":
-            return {"draft_id": 12, "account_id": args["account_id"], "sender": args["sender"], "status": "draft"}
+            return {"status": "draft", "account_id": args["account_id"], "sender": args["sender"],
+                    "ref": {**REF, "mailbox": ["Drafts"], "message_id": 12}}
         return {"operation": operation, **args}
 
 
@@ -94,24 +95,92 @@ def test_uncertain_write_errors_explain_manual_recovery_and_reads_still_work(tmp
         call(restarted, "set_message_status", {"ref": REF, "read": False})
     for error in (initial, blocked):
         assert str(tmp_path / "write-uncertain") in str(error.value)
-        assert "Stop all" in str(error.value)
         assert "Inspect Mail" in str(error.value)
+        assert "mail-app-mcp --clear-uncertain" in str(error.value)
         assert "writes.lock" in str(error.value)
-        assert "Restart" in str(error.value)
     assert len(mail.requests) == 1
     assert call(restarted, "read_message", {"ref": REF})["operation"] == "read_message"
     assert (tmp_path / "write-uncertain").exists()
 
 
-def test_show_draft_accepts_zero_but_rejects_negative_ids(tmp_path):
+def test_uncertain_marker_records_and_reports_what_was_attempted(tmp_path):
     mail = FixtureMail()
     server = create_server(bridge=mail, state_dir=tmp_path)
-    args = {"account_id": "work", "draft_id": 0, "sender": "work@example.org"}
-    assert call(server, "show_draft", args)["draft_id"] == 0
-    before = len(mail.requests)
+    mail.fail_write = True
     with pytest.raises(Exception):
-        call(server, "show_draft", {**args, "draft_id": -1})
-    assert len(mail.requests) == before
+        call(server, "set_message_status", {"ref": REF, "read": True})
+    record = json.loads((tmp_path / "write-uncertain").read_text())
+    assert record["operation"] == "set_message_status"
+    assert record["target"] == REF
+    assert record["pid"] > 0 and record["started_at"] and record["build"]
+    draft = {"account_id": "work", "sender": "work@example.org", "to": ["a@example.org"], "subject": "Hi", "body": "x"}
+    with pytest.raises(Exception) as blocked:
+        call(server, "create_draft", {"draft": draft})
+    assert '"operation": "set_message_status"' in str(blocked.value)
+    assert '"message_id": 7' in str(blocked.value)
+
+
+def test_legacy_empty_marker_still_blocks_and_says_it_has_no_details(tmp_path):
+    (tmp_path / "write-uncertain").touch(mode=0o600)
+    tmp_path.chmod(0o700)
+    server = create_server(bridge=FixtureMail(), state_dir=tmp_path)
+    with pytest.raises(Exception, match="no details recorded"):
+        call(server, "set_message_status", {"ref": REF, "read": True})
+
+
+def test_owner_clears_the_marker_from_the_command_line(tmp_path, monkeypatch, capsys):
+    from mail_app_mcp import server as module
+
+    monkeypatch.setattr(module, "DEFAULT_STATE_DIR", tmp_path)
+    monkeypatch.setattr("sys.argv", ["mail-app-mcp", "--clear-uncertain"])
+    module.main()
+    assert "No uncertain write" in capsys.readouterr().out
+    mail = FixtureMail()
+    mail.fail_write = True
+    with pytest.raises(Exception):
+        call(create_server(bridge=mail, state_dir=tmp_path), "set_message_status", {"ref": REF, "read": True})
+    module.main()
+    assert '"operation": "set_message_status"' in capsys.readouterr().out
+    assert not (tmp_path / "write-uncertain").exists()
+    mail.fail_write = False
+    assert call(create_server(bridge=mail, state_dir=tmp_path), "set_message_status", {"ref": REF, "read": True})
+
+
+def test_show_message_is_serialized_but_never_marks_or_waits_on_uncertainty(tmp_path):
+    mail = FixtureMail()
+    server = create_server(bridge=mail, state_dir=tmp_path)
+    mail.fail_write = True
+    with pytest.raises(Exception):
+        call(server, "show_message", {"ref": REF})
+    assert not (tmp_path / "write-uncertain").exists()
+    with pytest.raises(Exception):
+        call(server, "set_message_status", {"ref": REF, "read": True})
+    mail.fail_write = False
+    assert call(server, "show_message", {"ref": REF})["ref"] == REF
+    tool = next(tool for tool in asyncio.run(server.list_tools()) if tool.name == "show_message")
+    assert tool.annotations.destructiveHint is False
+
+
+def test_read_message_restores_own_address_recipients_and_attachment_types(tmp_path):
+    class HeaderMail(FixtureMail):
+        def call(self, operation, args):
+            return {"ref": REF, "to": [], "cc": ["Other@Example.org"], "body": "",
+                    "headers": ("To: =?utf-8?q?M=C3=A9?= <me@example.org>\nCc: other@example.org,\n"
+                                " \"Doe, Jane\" <jane@example.org>\nBcc: hidden@example.org\nSubject: x\n"),
+                    "attachments": [
+                        {"name": "report.pdf", "mime_type": "application/octet-stream", "warning": "unavailable"},
+                        {"name": "blob.bin", "mime_type": "application/octet-stream"},
+                        {"name": "logo.png", "mime_type": "image/png"},
+                    ]}
+
+    result = call(create_server(bridge=HeaderMail(), state_dir=tmp_path), "read_message", {"ref": REF})
+    assert "headers" not in result
+    assert result["to"] == ["me@example.org"]
+    assert result["cc"] == ["Other@Example.org", "jane@example.org"]
+    assert result["bcc"] == ["hidden@example.org"]
+    assert [item["mime_type"] for item in result["attachments"]] == [
+        "application/pdf", "application/octet-stream", "image/png"]
+    assert "guessed" in result["attachments"][0]["warning"]
 
 
 def test_mail_closed_is_a_tool_error_and_connection_recovers(tmp_path):
@@ -196,11 +265,10 @@ def test_draft_can_be_shown_without_exposing_send(tmp_path):
     mail = FixtureMail()
     server = create_server(bridge=mail, state_dir=tmp_path)
     draft = {"account_id": "work", "sender": "work@example.org", "to": ["recipient@example.org"], "subject": "Hi", "body": "draft"}
-    call(server, "create_draft", {"draft": draft, "open_window": True})
+    saved = call(server, "create_draft", {"draft": draft, "open_window": True})["ref"]
     assert mail.requests[-1][1]["open_window"] is True
-    result = call(server, "show_draft", {"account_id": "work", "draft_id": 12, "sender": "work@example.org"})
-    assert result["draft_id"] == 12
-    assert call(server, "show_message", {"ref": REF})["ref"] == REF
+    assert call(server, "show_message", {"ref": saved})["ref"] == saved
+    assert "show_draft" not in {tool.name for tool in asyncio.run(server.list_tools())}
 
 
 def test_slow_mail_does_not_block_protocol_requests(tmp_path):

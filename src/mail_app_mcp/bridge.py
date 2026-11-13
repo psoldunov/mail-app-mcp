@@ -16,12 +16,13 @@ READ_OPERATIONS = frozenset({
     "list_accounts", "list_mailboxes", "list_messages", "read_message",
     "search_messages", "save_attachment",
 })
-OPERATIONS = READ_OPERATIONS | frozenset({
-    "create_draft", "reply_draft", "set_message_status", "move_message",
-    "show_message", "show_draft",
-})
+# Opening a window cannot duplicate or lose mail, so its failures are never uncertain writes.
+UI_OPERATIONS = frozenset({"show_message"})
+WRITE_OPERATIONS = frozenset({"create_draft", "reply_draft", "set_message_status", "move_message"})
+OPERATIONS = READ_OPERATIONS | UI_OPERATIONS | WRITE_OPERATIONS
+PUBLIC_NAMES = {"save_attachment": "read_attachment"}
 MAX_RESPONSE = 2_000_000
-TIMEOUT_SECONDS = 30
+TIMEOUT_SECONDS = 45  # Drafts wait up to 30 s for Mail's saved copy after the source lookup.
 MAX_ERROR_DETAIL = 1000
 
 
@@ -31,12 +32,13 @@ class BridgeError(RuntimeError):
     def __init__(self, message: str, *, operation: str | None = None,
                  apple_script_error_number: int | float | None = None):
         self.operation = operation
-        self.retry_safe = operation in READ_OPERATIONS
+        # Only an uncertain write can have side effects; every other failure left Mail unchanged.
+        self.retry_safe = not isinstance(self, OutcomeUnknown)
         self.apple_script_error_number = apple_script_error_number
         if apple_script_error_number is not None:
             message += f" (apple_script_error_number={apple_script_error_number})"
         if operation is not None:
-            message = f"{operation}: {message} (retry_safe={str(self.retry_safe).lower()})"
+            message = f"{PUBLIC_NAMES.get(operation, operation)}: {message} (retry_safe={str(self.retry_safe).lower()})"
         super().__init__(message)
 
 
@@ -46,7 +48,7 @@ class OutcomeUnknown(BridgeError):
 
 def uncertain_error(message: str, operation: str | None,
                     apple_script_error_number: int | float | None = None) -> BridgeError:
-    error_type = BridgeError if operation in READ_OPERATIONS else OutcomeUnknown
+    error_type = BridgeError if operation in READ_OPERATIONS | UI_OPERATIONS else OutcomeUnknown
     if error_type is OutcomeUnknown:
         message += ". The write outcome is unknown. Do not retry a write before inspecting Mail."
     return error_type(message, operation=operation, apple_script_error_number=apple_script_error_number)
@@ -101,7 +103,7 @@ def decode_response(output: str, *, operation: str | None = None) -> dict:
         if type(number) not in (int, float):
             number = None
         if isinstance(error, str) and error.startswith("Outcome unknown:"):
-            if operation in READ_OPERATIONS:
+            if operation in READ_OPERATIONS | UI_OPERATIONS:
                 error = error.removeprefix("Outcome unknown:").strip()
             raise uncertain_error(error[:MAX_ERROR_DETAIL], operation, number)
         raise BridgeError(error[:MAX_ERROR_DETAIL] if isinstance(error, str) else "Mail operation failed",

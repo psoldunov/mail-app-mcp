@@ -1,14 +1,17 @@
 'use strict';
 
 var OPERATIONS = ['list_accounts', 'list_mailboxes', 'list_messages', 'search_messages', 'read_message',
-  'save_attachment', 'set_message_status', 'move_message', 'create_draft', 'reply_draft',
-  'show_message', 'show_draft'];
-var READ_OPERATIONS = ['list_accounts', 'list_mailboxes', 'list_messages', 'search_messages', 'read_message'];
+  'save_attachment', 'set_message_status', 'move_message', 'create_draft', 'reply_draft', 'show_message'];
+// Failures of these leave no uncertain mail state; showing a message only opens a window.
+var RETRY_SAFE_OPERATIONS = ['list_accounts', 'list_mailboxes', 'list_messages', 'search_messages', 'read_message',
+  'save_attachment', 'show_message'];
 var MAX_BOXES = 1000;
 var MAX_BODY_BYTES = 20 * 1024 * 1024;
-var MAX_SCAN = 200;
-var HEADER_BATCH_SIZE = 10;
+var MAX_QUOTE_CHARS = 100000;
 var SEARCH_BUDGET_MS = 10000;
+// A hidden reply's first saved copy is Mail's own quote; the copy with the scripted body replaced it
+// 5-15 s later in live runs.
+var SAVED_DRAFT_WAIT_MS = 30000;
 var MAX_SEARCH_MATCHES = 20000;
 var GLOBAL_SEARCH_BUDGET_MS = 20000;
 
@@ -61,10 +64,6 @@ function validate(operation, args) {
       (typeof args.read === 'boolean' || typeof args.flagged === 'boolean'), 'Invalid status');
   }
   if (operation === 'create_draft' || operation === 'reply_draft') validateDraft(operation, args);
-  if (operation === 'show_draft') {
-    requireValue(string(args.account_id) && integer(args.draft_id, 0, Number.MAX_SAFE_INTEGER) &&
-      address(args.sender), 'Invalid draft identity');
-  }
 }
 
 function address(value) {
@@ -133,6 +132,7 @@ function boxFor(mail, accountId, path) {
 }
 
 function messageFor(mail, ref) {
+  // A ref may name any mailbox that lists the message, such as a Gmail label stored in All Mail.
   var box = boxFor(mail, ref.account_id, ref.mailbox);
   var rediscover = '; call list_messages again and use the fresh ref. Draft autosave can change both IDs';
   var matches = box.messages.whose({ id: ref.message_id })();
@@ -140,7 +140,6 @@ function messageFor(mail, ref) {
   var message = matches[0];
   requireValue(message.id() === ref.message_id && message.messageId() === ref.header_message_id,
     'Message reference is stale' + rediscover);
-  requireValue(sameBox(message.mailbox(), ref.account_id, ref.mailbox), 'Message mailbox is stale' + rediscover);
   return message;
 }
 
@@ -169,54 +168,53 @@ function summary(message, args) {
   read: message.readStatus(), flagged: message.flaggedStatus() };
 }
 
-function headerBatch(box, start, end) {
-  // JXA ranges have an inclusive end; fetch only headers from this bounded window.
-  var window = box.messages.slice(start, end - 1);
-  var subjects = window.subject();
-  var senders = window.sender();
-  requireValue(Array.isArray(subjects) && Array.isArray(senders) &&
-    subjects.length === end - start && senders.length === subjects.length &&
-    subjects.concat(senders).every(function (value) { return typeof value === 'string'; }),
-  'Mailbox changed while searching; list messages again');
-  return { subjects: subjects, senders: senders };
+function mailboxSnapshot(box) {
+  // One whole-mailbox property read is a single Apple event; index and range reads cost one per message.
+  var messages = box.messages;
+  var ids = messages.id();
+  var snapshot = { ids: ids, subjects: messages.subject(), senders: messages.sender(),
+    dates: messages.dateReceived(), read: messages.readStatus(), flagged: messages.flaggedStatus(),
+    messageIds: messages.messageId() };
+  requireValue(Object.keys(snapshot).every(function (key) {
+    return Array.isArray(snapshot[key]) && snapshot[key].length === ids.length;
+  }) && snapshot.subjects.concat(snapshot.senders).every(function (value) { return typeof value === 'string'; }) &&
+    JSON.stringify(messages.id()) === JSON.stringify(ids), 'Mailbox changed while listing; list messages again');
+  return snapshot;
+}
+
+function snapshotMatches(box, snapshot, index, query, searchBody) {
+  if (snapshot.subjects[index].toLowerCase().indexOf(query) !== -1 ||
+    snapshot.senders[index].toLowerCase().indexOf(query) !== -1) return true;
+  if (!searchBody) return false;
+  var message = box.messages.byId(snapshot.ids[index]);
+  checkBodySize(message);
+  return message.content().toLowerCase().indexOf(query) !== -1;
 }
 
 function listMessages(mail, args) {
-  var deadline = Date.now() + SEARCH_BUDGET_MS;
   var box = boxFor(mail, args.account_id, args.mailbox);
-  var total = box.messages.length;
-  var index = Math.min(args.offset, total);
-  var scanned = 0;
-  var found = [];
+  var snapshot = mailboxSnapshot(box);
+  // The budget bounds per-message body reads; header matching is local and covers the whole mailbox.
+  var deadline = Date.now() + SEARCH_BUDGET_MS;
+  var total = snapshot.ids.length;
+  var start = Math.min(args.offset, total);
   var query = args.query.toLowerCase();
-  var batch;
-  var batchStart = index;
-  var batchEnd = index;
-  while (index < total && scanned < MAX_SCAN && found.length < args.limit && Date.now() < deadline) {
-    if (index === batchEnd) {
-      batchStart = index;
-      batchEnd = Math.min(index + HEADER_BATCH_SIZE, total, index + MAX_SCAN - scanned);
-      batch = headerBatch(box, batchStart, batchEnd);
-    }
-    var position = index - batchStart;
-    var message = box.messages[index];
-    index += 1;
-    scanned += 1;
-    var match = batch.subjects[position].toLowerCase().indexOf(query) !== -1 ||
-      batch.senders[position].toLowerCase().indexOf(query) !== -1;
-    if (!match && args.search_body) {
-      checkBodySize(message);
-      match = message.content().toLowerCase().indexOf(query) !== -1;
-    }
-    if (match) {
-      var item = summary(message, args);
-      requireValue(item.subject === batch.subjects[position] && item.sender === batch.senders[position],
-        'Mailbox changed while searching; list messages again');
-      found = found.concat([item]);
+  var found = [];
+  var stopped = 'end';
+  var index = start;
+  for (; index < total; index += 1) {
+    if (found.length >= args.limit) { stopped = 'limit'; break; }
+    if (index > start && Date.now() >= deadline) { stopped = 'time_budget'; break; }
+    if (snapshotMatches(box, snapshot, index, query, args.search_body)) {
+      // Refs keep the listed mailbox; Gmail stores label views such as INBOX in All Mail.
+      found = found.concat([{ ref: { account_id: args.account_id, mailbox: args.mailbox,
+        message_id: snapshot.ids[index], header_message_id: snapshot.messageIds[index] },
+      subject: snapshot.subjects[index], sender: snapshot.senders[index],
+      date_received: snapshot.dates[index].toISOString(), read: snapshot.read[index], flagged: snapshot.flagged[index] }]);
     }
   }
-  requireValue(scanned > 0 || index >= total, 'Mail took too long to resolve the mailbox; try again later');
-  return { messages: found, next_offset: index < total ? index : null, complete: index >= total, scanned: scanned };
+  return { messages: found, next_offset: index < total ? index : null, complete: index >= total,
+    scanned: index - start, stopped: stopped };
 }
 
 function searchBoxes(mail, args) {
@@ -317,6 +315,15 @@ function attachmentInfo(attachment) {
     size: attachment.fileSize(), downloaded: attachment.downloaded() });
 }
 
+function allHeaders(message) {
+  try { return message.allHeaders(); }
+  catch (error) {
+    // Same getter failure as attachment MIME types; Mail's own recipient lists still apply.
+    if (error.errorNumber !== -10000) throw error;
+    return '';
+  }
+}
+
 function checkBodySize(message) {
   requireValue(integer(message.messageSize(), 1, MAX_BODY_BYTES),
     'Message size is unknown or exceeds 20 MiB; search headers only or read it manually in Mail');
@@ -329,6 +336,8 @@ function readMessage(mail, args) {
   return { ref: args.ref, subject: message.subject(), sender: message.sender(),
     to: message.toRecipients().map(function (recipient) { return recipient.address(); }),
     cc: message.ccRecipients().map(function (recipient) { return recipient.address(); }),
+    // Mail drops recipients that are the account's own addresses; the server merges them back from headers.
+    headers: allHeaders(message),
     body: content.slice(0, args.max_chars), truncated: content.length > args.max_chars,
     attachments: message.mailAttachments().map(attachmentInfo) };
 }
@@ -411,30 +420,79 @@ function verifySender(mail, accountId, sender) {
   requireValue(owners.length === 1 && owners[0].id() === accountId, 'Sender account is ambiguous');
 }
 
-function openDraftWindow(mail, draft) {
-  draft.visible = true;
-  mail.activate();
+function pause(seconds) { $.NSThread.sleepForTimeInterval(seconds); }
+function squash(text) { return String(text).replace(/\s+/g, ''); }
+
+function savedCopy(mail, expected) {
+  // Mail writes the saved copy into Drafts asynchronously and may add a signature or line spacing.
+  var drafts = mail.draftsMailbox();
+  var deadline = Date.now() + SAVED_DRAFT_WAIT_MS;
+  var withoutBody = false;
+  while (Date.now() < deadline) {
+    var fresh = drafts.messages.id().filter(function (id) { return expected.known.indexOf(id) === -1; })
+      .sort(function (a, b) { return b - a; });
+    var candidates = [].concat.apply([], fresh.map(function (id) {
+      return drafts.messages.whose({ id: id })().filter(function (message) {
+        return boxIdentity(message.mailbox()).account_id === expected.account_id &&
+          squash(message.subject()) === squash(expected.subject);
+      });
+    }));
+    var match = candidates.filter(function (message) {
+      return squash(message.content()).indexOf(squash(expected.body)) !== -1;
+    })[0];
+    if (match) {
+      var identity = boxIdentity(match.mailbox());
+      return { message: match, ref: { account_id: identity.account_id, mailbox: identity.mailbox,
+        message_id: match.id(), header_message_id: match.messageId() } };
+    }
+    withoutBody = candidates.length > 0;
+    pause(0.25);
+  }
+  requireValue(!withoutBody, 'Mail saved this draft without the requested body and did not replace it within ' +
+    SAVED_DRAFT_WAIT_MS / 1000 + ' seconds. Check Drafts in Mail before retrying');
+  return null;
 }
 
-function saveDraft(mail, draft, accountId, sender, openWindow) {
+function saveDraft(mail, draft, expected) {
   mail.save(draft);
-  var id = draft.id();
-  requireValue(integer(id, 0, Number.MAX_SAFE_INTEGER) && draft.sender() === sender,
-    'Draft outcome unknown; do not retry automatically');
-  if (openWindow) openDraftWindow(mail, draft);
-  return { draft_id: id, account_id: accountId, sender: sender, status: 'draft' };
+  requireValue(draft.sender() === expected.sender, 'Draft sender changed after saving');
+  var saved = savedCopy(mail, expected);
+  var result = { status: 'draft', account_id: expected.account_id, sender: expected.sender, ref: saved && saved.ref };
+  if (!saved) {
+    return Object.assign(result, { warning: 'Saved, but the copy did not appear in Drafts within ' +
+      SAVED_DRAFT_WAIT_MS / 1000 + ' seconds' +
+      (expected.open_window ? ', so no window was opened' : '') + '. Do not retry; find it with list_messages on Drafts.' });
+  }
+  // Mail cannot reshow a hidden compose window, so open the saved copy instead.
+  if (expected.open_window) {
+    mail.open(saved.message);
+    mail.activate();
+  }
+  return result;
 }
 
 function createDraft(mail, args) {
   verifySender(mail, args.account_id, args.sender);
+  var known = mail.draftsMailbox().messages.id();
   var draft = mail.OutgoingMessage({ subject: args.subject, content: args.body, sender: args.sender, visible: false });
   return mutation(function () {
     mail.outgoingMessages.push(draft);
     args.to.forEach(function (value) { draft.toRecipients.push(mail.ToRecipient({ address: value })); });
     args.cc.forEach(function (value) { draft.ccRecipients.push(mail.CcRecipient({ address: value })); });
     args.bcc.forEach(function (value) { draft.bccRecipients.push(mail.BccRecipient({ address: value })); });
-    return saveDraft(mail, draft, args.account_id, args.sender, args.open_window);
+    return saveDraft(mail, draft, { account_id: args.account_id, sender: args.sender, subject: args.subject,
+      body: args.body, known: known, open_window: args.open_window });
   });
+}
+
+function quoted(message) {
+  var content = message.content().replace(/￼/g, '');
+  var lines = content.slice(0, MAX_QUOTE_CHARS).split(/\r\n|\r|\n/)
+    .concat(content.length > MAX_QUOTE_CHARS ? ['[…]'] : []);
+  var date = (message.dateSent() || message.dateReceived())
+    .toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+  return '\n\nOn ' + date + ', ' + message.sender() + ' wrote:\n\n' +
+    lines.map(function (line) { return '> ' + line; }).join('\n');
 }
 
 function replyDraft(mail, args) {
@@ -447,32 +505,26 @@ function replyDraft(mail, args) {
     return boxIdentity(draft.mailbox()).account_id === args.ref.account_id;
   }), 'Cannot reply to a saved draft. Select a received message, or use create_draft for a new draft');
   checkBodySize(message);
+  var content = args.body + quoted(message);
+  var known = mail.draftsMailbox().messages.id();
   return mutation(function () {
     var draft = mail.reply(message, { openingWindow: false, replyToAll: args.reply_all });
+    // Mail opens reply windows regardless of openingWindow, and a visible compose view autosaves its own
+    // quote over scripted content. Hidden replies keep scripted content but lose Mail's quote, hence quoted().
+    draft.visible = false;
     draft.sender = args.sender;
-    draft.content = args.body + '\n\n' + draft.content();
-    return saveDraft(mail, draft, args.ref.account_id, args.sender, args.open_window);
+    draft.content = content;
+    return saveDraft(mail, draft, { account_id: args.ref.account_id, sender: args.sender, subject: draft.subject(),
+      body: args.body, known: known, open_window: args.open_window });
   });
 }
 
 function showMessage(mail, args) {
   var message = messageFor(mail, args.ref);
   rejectUnsafeBox(mail, message.mailbox(), false);
-  return mutation(function () {
-    mail.open(message);
-    mail.activate();
-    return { shown: true };
-  });
-}
-
-function showDraft(mail, args) {
-  verifySender(mail, args.account_id, args.sender);
-  var draft = one(mail.outgoingMessages.whose({ id: args.draft_id })(), 'Draft');
-  requireValue(draft.id() === args.draft_id && draft.sender() === args.sender, 'Draft identity is stale');
-  return mutation(function () {
-    openDraftWindow(mail, draft);
-    return { shown: true, draft_id: args.draft_id, account_id: args.account_id };
-  });
+  mail.open(message);
+  mail.activate();
+  return { shown: true };
 }
 
 function dispatch(mail, operation, args) {
@@ -489,7 +541,6 @@ function dispatch(mail, operation, args) {
   case 'create_draft': return createDraft(mail, args);
   case 'reply_draft': return replyDraft(mail, args);
   case 'show_message': return showMessage(mail, args);
-  case 'show_draft': return showDraft(mail, args);
   }
 }
 
@@ -536,11 +587,11 @@ function run() {
     return JSON.stringify({ ok: true, result: dispatch(mail, request.operation, request.args) });
   } catch (error) {
     var operation = request && request.operation;
-    var readOnly = READ_OPERATIONS.indexOf(operation) !== -1;
+    var retrySafe = RETRY_SAFE_OPERATIONS.indexOf(operation) !== -1;
     var detail = String(error.message || error).slice(0, 1000);
     return JSON.stringify({ ok: false, operation: operation,
       apple_script_error_number: typeof error.errorNumber === 'number' ? error.errorNumber : null,
-      error: error.safeMessage || readOnly ? detail : 'Outcome unknown: ' + detail });
+      error: error.safeMessage || retrySafe ? detail : 'Outcome unknown: ' + detail });
   }
 }
 

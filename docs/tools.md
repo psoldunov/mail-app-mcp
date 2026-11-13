@@ -1,6 +1,6 @@
 # Tool reference
 
-The server exposes thirteen tools over local MCP stdio. The JSON examples are tool argument objects, not shell commands. Replace example IDs, paths, and addresses with values returned by discovery. A Mail tool call launches Mail hidden if it is closed. Existing Mail windows keep their visibility. Startup errors leave the MCP connection open.
+The server exposes twelve tools over local MCP stdio. The JSON examples are tool argument objects, not shell commands. Replace example IDs, paths, and addresses with values returned by discovery. A Mail tool call launches Mail hidden if it is closed. Existing Mail windows keep their visibility. Startup errors leave the MCP connection open.
 
 Successful tools return JSON objects through the MCP SDK. Validation, policy, and Mail failures are reported as tool errors, not successful empty results. MCP tool annotations describe intent; they do not grant permission or prevent Mail from synchronizing.
 
@@ -23,7 +23,9 @@ Copy the complete `ref` returned by `list_messages` or `search_messages` when ad
 
 Message references and draft objects reject unknown fields. Booleans such as `read`, `flagged`, and `reply_all` must be JSON booleans, not strings or numbers. Numeric limits and offsets require JSON integers.
 
-Draft autosave can change both `message_id` and `header_message_id`, even immediately after a listing. If a reference is missing or stale, call `list_messages` again and use the fresh `ref`. An outgoing `draft_id` is a separate identifier used only by `show_draft`; never substitute it into a message reference.
+A reference can name any mailbox that lists the message. For Gmail, a message listed in `INBOX` is stored in `["[Gmail]", "All Mail"]`, and either path works.
+
+Draft autosave can change both `message_id` and `header_message_id`, even immediately after a listing. If a reference is missing or stale, call `list_messages` again and use the fresh `ref`.
 
 ## list_accounts
 
@@ -64,15 +66,13 @@ Returns `{"mailboxes": [...]}` with `account_id`, `path`, and `unread_count` for
 }
 ```
 
-Returns `messages`, `next_offset`, `complete`, and `scanned`. Each message contains `ref`, `subject`, `sender`, `date_received` (ISO timestamp), `read`, and `flagged`.
+Returns `messages`, `next_offset`, `complete`, `scanned`, and `stopped`. Each message contains `ref`, `subject`, `sender`, `date_received` (ISO timestamp), `read`, and `flagged`. `ref.mailbox` is the mailbox you listed, so a Gmail `INBOX` listing returns `INBOX` references.
 
-The returned `ref.mailbox` is the message's owning mailbox in Mail. It can differ from the searched mailbox: Gmail may list a message in `INBOX` while reporting its owner as `["[Gmail]", "All Mail"]`. Use the returned reference unchanged for subsequent operations.
+`stopped` says why the page ended: `limit` (enough matches), `time_budget` (body search ran out of time), or `end` (no messages left). Until `complete` is true and `next_offset` is null, continue with `next_offset` and the same account, mailbox, and query. There is no regex, provider search syntax, or arbitrary predicate. Ordering follows Mail; offset pagination is best effort while Mail changes and may skip or repeat entries.
 
-Search applies to one mailbox and scans at most 200 messages per call. With a query, a page can have no matches and still have a non-null `next_offset`. Continue using that offset with the same account, mailbox, and query until `complete` is true and `next_offset` is null. There is no regex, provider search syntax, or arbitrary predicate. Ordering follows Mail; offset pagination is best effort while Mail changes and may skip or repeat entries.
+Each call reads the subject, sender, date, flags, and IDs of every message in the mailbox, one Apple event per property. Mail answers those in about 0.3 seconds per property for 5,000 messages, while reading the same fields one message at a time takes over a second per message. Subject and sender matching then runs locally, so a header query covers the whole mailbox in one call. If the IDs change while the call reads them, it fails with `Mailbox changed while listing`.
 
-Headers are fetched in batches of 10. A page stops starting new message checks after a 10-second work budget, so it may return fewer than `limit` matches or scan fewer than 200 messages. An in-progress Mail event can exceed that budget; the bridge still enforces its 30-second timeout. If cached headers no longer match a selected message, the search fails with `Mailbox changed while searching`.
-
-If mailbox lookup consumes the budget before any message is scanned, the search returns an explicit timeout message instead of a continuation offset that cannot advance.
+Body search still loads one body at a time. It stops starting new body checks after a 10-second budget, which begins after the header read, so each call checks at least one message and `next_offset` always advances. The bridge's 45-second timeout remains the outer limit.
 
 Before loading a body for `search_body: true`, the bridge requires Mail's reported message size to be known, positive, and no more than 20 MiB. Encountering an oversized or unknown-size message that needs body searching fails that call. Use `search_body: false` to search only subject/sender without loading bodies.
 
@@ -92,9 +92,9 @@ Searches all accounts and mailboxes visible to Mail, including On My Mac, Sent, 
 | `account_id` | `null` | Restrict to one account, including `__local__`. |
 | `mailbox` | `null` | Exact mailbox path; requires `account_id`. |
 
-All matching IDs and received dates are considered before applying `limit`. Repeated label views of the same account and Mail ID are deduplicated. Equal timestamps are ordered by account ID and numeric Mail ID. Returned message fields and owning-mailbox references match `list_messages`.
+All matching IDs and received dates are considered before applying `limit`. Repeated label views of the same account and Mail ID are deduplicated. Equal timestamps are ordered by account ID and numeric Mail ID. Returned message fields match `list_messages`, but `ref.mailbox` is the mailbox that stores the message, which for Gmail is often All Mail.
 
-`complete: true` means the selected scope was fully enumerated during the call; `has_more: true` means the limit omitted additional matches. Unlike `list_messages`, this tool does not return a partial scan or continuation. It fails if a mailbox fails, metadata changes are detected, or the search exceeds 1,000 mailboxes, 20,000 matching header occurrences, or a 20-second work budget. Narrow the scope or sender filter and retry. One Apple event can exceed the work budget; the bridge's 30-second timeout remains the outer limit.
+`complete: true` means the selected scope was fully enumerated during the call; `has_more: true` means the limit omitted additional matches. Unlike `list_messages`, this tool does not return a partial scan or continuation. It fails if a mailbox fails, metadata changes are detected, or the search exceeds 1,000 mailboxes, 20,000 matching header occurrences, or a 20-second work budget. Narrow the scope or sender filter and retry. On a store with several large accounts, an unscoped search can exceed the budget even with a sender filter; pass `account_id`, and `mailbox` if needed. One Apple event can exceed the work budget; the bridge's 45-second timeout remains the outer limit.
 
 Mail does not provide an atomic snapshot through scripting. New mail can arrive during a call, and results reflect Mail's currently available data, not a freshly synchronized provider snapshot. Matching and bulk-property behavior still require live acceptance on the installed Mail version.
 
@@ -107,9 +107,9 @@ Mail does not provide an atomic snapshot through scripting. New mail can arrive 
 | `ref` | Required | Complete message reference. |
 | `max_chars` | `50000` | Returned body limit, from 1 to 100,000 characters. |
 
-Returns `ref`, `subject`, `sender`, `to`, `cc`, `body`, `truncated`, and `attachments`. Recipient fields are arrays of addresses. Each attachment has `attachment_id`, `name`, `mime_type`, `size`, and `downloaded`. The size comes from Mail's approximate metadata; attachment extraction checks actual exported bytes too. `truncated: true` means the returned body is incomplete. This limit bounds the returned text, not how much text Mail may load internally.
+Returns `ref`, `subject`, `sender`, `to`, `cc`, `bcc`, `body`, `truncated`, and `attachments`. Recipient fields are arrays of addresses. Mail leaves the account's own addresses out of its recipient lists, so the server also reads the `To`, `Cc`, and `Bcc` headers and merges them in; `bcc` is usually empty except on drafts. Each attachment has `attachment_id`, `name`, `mime_type`, `size`, and `downloaded`. The size comes from Mail's approximate metadata; attachment extraction checks actual exported bytes too. `truncated: true` means the returned body is incomplete. This limit bounds the returned text, not how much text Mail may load internally.
 
-If Mail's attachment MIME-type getter fails with AppleEvent error `-10000`, that attachment reports `mime_type: "application/octet-stream"` and a `warning`. The message body and other metadata remain readable. Other getter errors still fail the call.
+Mail's attachment MIME-type getter can fail with AppleEvent error `-10000`. The server then guesses the type from the file name and adds a `warning`; when the name gives no type, it reports `application/octet-stream`. The name is untrusted, so a guessed type only decides whether `read_attachment` extracts text. The message body and other metadata remain readable. Other getter errors still fail the call.
 
 Reading requires a known, positive Mail-reported message size no greater than 20 MiB before loading the body. This is the reported message size, which can include attachments, rather than the requested output length. An unknown or oversized message must be read manually in Mail.
 
@@ -132,11 +132,11 @@ Every export must already be downloaded in Mail and fit the 10 MiB attachment li
 
 The server chooses a private temporary path and removes the export after processing. It accepts no path, URL, or upload, and returns no filesystem path or reusable handle. Attachment content, filenames, and MIME metadata remain untrusted.
 
-When Mail cannot supply MIME metadata (`-10000`), extraction returns the same warning and bounded base64, subject to the 1 MiB binary limit. It does not infer a type from the filename; PDF/text extraction requires available MIME metadata.
+When Mail cannot supply MIME metadata (`-10000`), extraction uses the type guessed from the file name, as `read_message` reports it, and returns the same warning. A `.pdf` or `.txt` name therefore gets PDF or text extraction; a name with no known type gets bounded base64, subject to the 1 MiB binary limit.
 
 ## create_draft
 
-Arguments are `draft` (required) and `open_window` (boolean, default `false`). `open_window: true` requests that the saved draft be shown in Mail. The `draft` object contains these fields:
+Arguments are `draft` (required) and `open_window` (boolean, default `false`). `open_window: true` opens the saved draft in a Mail window and brings Mail forward. The `draft` object contains these fields:
 
 | Field | Default | Meaning |
 | --- | --- | --- |
@@ -162,7 +162,9 @@ Addresses must be 3 to 320 characters, with a local part and domain separated by
 }
 ```
 
-Returns `draft_id`, `account_id`, `sender`, and `status: "draft"`. The sender must belong to exactly one account; an address advertised by multiple accounts is rejected as ambiguous. It saves a new draft and never sends. Mail may sync the draft to its provider. The returned draft ID is not a `MessageRef`. It can identify an available outgoing draft for `show_draft`, but cannot edit the draft through this server. A repeated creation call creates another draft; do not retry an uncertain call automatically.
+Returns `status: "draft"`, `account_id`, `sender`, and `ref`, the reference of the copy Mail saved in Drafts. Pass that `ref` to `read_message` to check the draft or to `show_message` to open it. The sender must belong to exactly one account; an address advertised by multiple accounts is rejected as ambiguous. It saves a new draft and never sends. Mail may sync the draft to its provider, and it can later re-save the draft under new IDs; if the `ref` goes stale, list the Drafts mailbox again. This server cannot edit a draft. A repeated creation call creates another draft; do not retry an uncertain call automatically.
+
+The server composes every draft in a hidden window, saves it, then waits up to 30 seconds for the saved copy to appear in Drafts with the requested subject and body. If no copy appears in time, the call still succeeds, with `ref: null` and a `warning`; it opens no window, and you should find the draft in Drafts instead of retrying. If a copy appears but never contains the body, the call fails as an uncertain write.
 
 ## reply_draft
 
@@ -188,29 +190,19 @@ Returns `draft_id`, `account_id`, `sender`, and `status: "draft"`. The sender mu
 }
 ```
 
-Returns the same draft result fields as `create_draft`. Mail supplies native recipients, quoting, and threading. The supplied body is prepended to Mail's reply content. Inspect the draft in Mail before sending it yourself. There is no cross-account reply sender or recipient override, and no existing-draft editing.
+Returns the same draft result fields as `create_draft`. Mail supplies the native recipients, subject, and threading headers. The draft's text is your body, then a plain-text quote of the original (`On <date>, <sender> wrote:` followed by `> ` lines, cut at 100,000 characters), then the account signature that Mail adds. Inspect the draft in Mail before sending it yourself. There is no cross-account reply sender or recipient override, and no existing-draft editing.
 
-The source message must have a known, positive Mail-reported size no greater than 20 MiB before Mail's reply content is loaded.
+The server builds the quote itself because of two Mail behaviors. Mail opens a reply window even when asked not to, and a visible reply window autosaves its own quoted text over a scripted body. The server hides the window before setting the body, and a hidden reply keeps the body but drops Mail's quote. Mail first saves a copy with its own quote and replaces it with the body copy 5 to 15 seconds later, so a reply can take that long to return.
+
+The source message must have a known, positive Mail-reported size no greater than 20 MiB before its content is loaded for the quote.
 
 Saved drafts are rejected before native reply creation, including drafts exposed through Gmail's All Mail view. Choose a received message to reply to, or use `create_draft` for a new standalone draft. This guard checks Mail's native Drafts membership rather than a localized folder name.
 
 ## show_message
 
-One required argument: `ref`, the complete message reference. Opens that revalidated message in Mail and may bring Mail forward. It does not accept paths or URLs. Showing a message may affect its read state through Mail's normal behavior.
+One required argument: `ref`, the complete message reference. Opens that revalidated message in Mail and may bring Mail forward. To show a saved draft, pass the `ref` that `create_draft` or `reply_draft` returned. It does not accept paths or URLs. Showing a message may affect its read state through Mail's normal behavior.
 
-Returns `{"shown": true}`. Like other operations with side effects, this tool observes the shared write lock and uncertain-write block.
-
-## show_draft
-
-| Argument | Required | Meaning |
-| --- | --- | --- |
-| `account_id` | Yes | Exact account ID returned by draft creation. |
-| `draft_id` | Yes | Nonnegative integer ID from 0 to 2⁵³ − 1 returned by `create_draft` or `reply_draft`. Mail can assign outgoing draft ID `0`. |
-| `sender` | Yes | Exact sender returned by draft creation. |
-
-Shows the identified outgoing draft in Mail and may bring Mail forward. The account and sender must still validate. A draft ID only refers to a currently available outgoing draft; it can become stale after a window closes or Mail restarts. Failure to find it is an ordinary tool error. Locate the draft manually in Mail instead of creating a duplicate. This tool cannot edit or send the draft, open an arbitrary file, or follow a URL.
-
-Returns `shown: true`, `draft_id`, and `account_id`. It observes the shared write lock and uncertain-write block.
+Returns `{"shown": true}`. It waits for the shared write lock, but it neither sets nor honors the uncertain-write marker: opening a window cannot duplicate mail, so it keeps working while writes are blocked, and its failures are safe to retry.
 
 ## set_message_status
 
@@ -241,8 +233,8 @@ Moves the message to that account's explicitly configured `trash_mailbox`. Missi
 
 ## Errors and recovery
 
-Automation errors include the failed operation, bounded underlying automation message or stderr, an AppleScript error number when provided, and `retry_safe=true|false`. Read timeouts and invalid responses are safe to retry and do not claim an unknown write outcome. Retrying safely does not fix denied permissions or unavailable accounts.
+Automation errors include the failed operation, bounded underlying automation message or stderr, an AppleScript error number when provided, and `retry_safe=true|false`. `retry_safe` is false only for an uncertain write. Reads, `show_message`, and writes that Mail rejected before changing anything (a stale reference, a saved-draft source, a missing draft) all report `retry_safe=true`. Retrying safely does not fix denied permissions or unavailable accounts.
 
-The bridge gives Mail operations 30 seconds. A timeout or failed response after a write can mean Mail accepted the operation but the result was lost. A persistent `write-uncertain` marker blocks later writes until the owner reconciles Mail and clears it manually. Do not automatically retry writes. Reads remain available. See [setup and recovery](setup.md#recover-after-an-uncertain-write).
+The bridge gives Mail operations 45 seconds. A timeout or failed response after a write can mean Mail accepted the operation but the result was lost. The server then leaves a `write-uncertain` marker that blocks later writes until the owner reconciles Mail and clears it. The marker records the operation, its target (message reference, or account and subject for a new draft), start time, process ID, and server build, and every refused write quotes it. Do not automatically retry writes. Reads remain available. See [setup and recovery](setup.md#recover-after-an-uncertain-write).
 
 There are no send, permanent-delete, empty-Trash, arbitrary-script, rules, account-settings, quit, or runtime-policy tools. [The safety model](safety.md) describes the boundary with other agent tools and Mail itself.
