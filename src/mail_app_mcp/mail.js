@@ -19,6 +19,8 @@ var SETTLE_POLLS = 5;
 var MAX_SEARCH_MATCHES = 20000;
 var STATUS_POLLS = 10;
 var STATUS_SETTLE_POLLS = 3;
+var MOVE_POLLS = 10;
+var MAIL_STARTUP_SECONDS = 15;
 // A cold first search over ~40 Gmail mailboxes took 20 s; warm ones take ~4 s. The bridge stops at 60 s.
 var GLOBAL_SEARCH_BUDGET_MS = 35000;
 
@@ -404,7 +406,8 @@ function readMessage(mail, args) {
     cc: message.ccRecipients().map(function (recipient) { return recipient.address(); }),
     // Mail drops recipients that are the account's own addresses; the server merges them back from headers.
     headers: allHeaders(message),
-    source: sourceComplete ? source : undefined, source_truncated: !sourceComplete,
+    source: typeof source === 'string' ? source.slice(0, MAX_SOURCE_CHARS) : undefined,
+    source_truncated: !sourceComplete,
     body: content.slice(0, args.max_chars), truncated: content.length > args.max_chars,
     attachments: message.mailAttachments().map(attachmentInfo) };
 }
@@ -463,11 +466,32 @@ function moveMessage(mail, args) {
   var destination = boxFor(mail, args.ref.account_id, args.destination);
   rejectUnsafeBox(mail, message.mailbox(), false);
   rejectUnsafeBox(mail, destination, true);
+  requireValue(JSON.stringify(args.ref.mailbox) !== JSON.stringify(args.destination), 'Message is already in destination');
+  requireValue(string(args.ref.header_message_id), 'A nonempty Message-ID is required to verify a move');
+  requireValue(destination.messages.whose({ messageId: args.ref.header_message_id })().length === 0,
+    'Destination already contains this Message-ID; overlapping-label moves are unsupported. ' +
+    'For Gmail All Mail, archive in Mail instead. No move was attempted');
+  requireValue(boxFor(mail, args.ref.account_id, args.ref.mailbox).messages
+    .whose({ messageId: args.ref.header_message_id })().length === 1, 'Source Message-ID is ambiguous');
   return mutation(function () {
-    message.mailbox = destination;
-    requireValue(sameBox(message.mailbox(), args.ref.account_id, args.destination) &&
-      message.messageId() === args.ref.header_message_id, 'Move verification failed');
-    return { account_id: args.ref.account_id, destination: args.destination, moved: true };
+    try { mail.move(message, { to: destination }); }
+    catch (error) {
+      // Mail may invalidate the command's result specifier after completing the move.
+      if (error.errorNumber !== -1728) throw error;
+    }
+    for (var poll = 0; poll < MOVE_POLLS; poll += 1) {
+      pause(0.5);
+      // A move invalidates the source handle and may give the destination copy a new numeric ID.
+      var source = boxFor(mail, args.ref.account_id, args.ref.mailbox);
+      var target = boxFor(mail, args.ref.account_id, args.destination);
+      var remaining = source.messages.whose({ messageId: args.ref.header_message_id })();
+      var arrived = target.messages.whose({ messageId: args.ref.header_message_id })();
+      if (remaining.length === 0 && arrived.length === 1) {
+        return { account_id: args.ref.account_id, destination: args.destination, moved: true };
+      }
+    }
+    requireValue(false, 'Move verification failed: message must leave the source and exist in the destination. ' +
+      'Gmail All Mail may require archiving in Mail; no delete fallback was attempted');
   });
 }
 
@@ -667,7 +691,7 @@ function mailProcess() {
     var launchError = Ref();
     var launched = workspace.launchApplicationAtURLOptionsConfigurationError(
       workspace.URLForApplicationWithBundleIdentifier('com.apple.mail'),
-      $.NSWorkspaceLaunchWithoutActivation | $.NSWorkspaceLaunchAndHide,
+      $.NSWorkspaceLaunchWithoutActivation | $.NSWorkspaceLaunchAndHide | $.NSWorkspaceLaunchAsync,
       $.NSDictionary.dictionary, launchError);
     requireValue(Boolean(ObjC.unwrap(launched)), launchError[0]
       ? 'Could not launch Mail hidden: ' + ObjC.unwrap(launchError[0].localizedDescription)
@@ -686,6 +710,11 @@ function mailProcess() {
   requireValue(!process.terminated, 'Mail is no longer running');
   var pid = Number(process.processIdentifier);
   requireValue(integer(pid, 1, Number.MAX_SAFE_INTEGER), 'Invalid running Mail process');
+  // shortcut: launch age is a conservative settling window; extend if Mail versions need longer.
+  var launchDate = process.launchDate;
+  requireValue(process.finishedLaunching !== false &&
+    (!ObjC.unwrap(launchDate) || Number(launchDate.timeIntervalSinceNow) <= -MAIL_STARTUP_SECONDS),
+  'Mail is starting; no operation was attempted. Wait 15 seconds and retry');
   return pid;
 }
 

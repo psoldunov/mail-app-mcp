@@ -134,6 +134,7 @@ Use actual absolute paths; do not rely on shell expansion of `~`. Starting the e
 
 | Symptom | Action |
 | --- | --- |
+| Mail is starting | No operation was attempted. Wait 15 seconds and retry. If Mail remains unready, open it manually to inspect setup prompts. |
 | Mail cannot start | The tool reports the startup error while the MCP connection stays open. Open Mail manually to inspect setup or permission prompts, then retry a read. |
 | Automation permission denied | Check the responsible launcher under macOS Automation settings. Inspect Mail before repeating any attempted write. |
 | `programs.mcp` option is missing | Use a Home Manager revision that provides it, such as the pinned revision in the README. |
