@@ -58,4 +58,5 @@ def read_attachment_content(bridge, directory: Path, ref: MessageRef, attachment
         if not isinstance(mime, str):
             raise ValueError("Invalid attachment MIME type")
         return {"name": metadata.get("name", "attachment"), "mime_type": mime, "size": info.st_size,
-                "untrusted": True, **extract_content(path, mime.split(";", 1)[0].lower())}
+                "untrusted": True, **({"warning": metadata["warning"]} if "warning" in metadata else {}),
+                **extract_content(path, mime.split(";", 1)[0].lower())}

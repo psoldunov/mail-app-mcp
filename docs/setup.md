@@ -139,6 +139,8 @@ Use actual absolute paths; do not rely on shell expansion of `~`. Starting the e
 
 ### Recover after an uncertain write
 
+Both the initial uncertain-write error and later blocked-write errors include the exact marker path and these recovery steps. A blocked call attempts no new write. The existing marker is never cleared automatically.
+
 1. Stop all MCP clients' `mail-app-mcp` processes to prevent new operations. Inspect Mail for the attempted change. A timeout does not mean that Mail canceled the Apple event; allow it to finish and reconcile the actual message or draft state.
 2. When you have established the outcome, remove only the marker `~/Library/Caches/mail-app-mcp/write-uncertain`. Do not remove the shared `writes.lock` file. No MCP tool clears this marker.
 3. Restart your server, rediscover affected messages, and decide whether a new write is needed. Never replay a draft creation blindly: it can create duplicates.

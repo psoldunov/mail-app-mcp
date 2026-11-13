@@ -298,6 +298,51 @@ function composing(mail) {
   return { saved, drafts };
 }
 
+test('unavailable MIME metadata preserves message reads and bounded attachment export with a warning', () => {
+  const { mail, ref, messages } = fixture();
+  const attachment = { id: () => 'att1', name: () => 'signature.png',
+    mimeType: () => { throw Object.assign(new Error('AppleEvent handler failed.'), { errorNumber: -10000 }); },
+    fileSize: () => 12, downloaded: () => true };
+  messages[0].mailAttachments = collection([attachment]);
+  const read = dispatch(mail, 'read_message', { ref, max_chars: 4 });
+  assert.equal(read.body, 'Body');
+  assert.equal(read.attachments[0].mime_type, 'application/octet-stream');
+  assert.match(read.attachments[0].warning, /MIME.*unavailable.*-10000/);
+  global.Path = (path) => path;
+  let saves = 0;
+  mail.save = () => { saves += 1; };
+  try {
+    const exported = dispatch(mail, 'save_attachment', { ref, attachment_id: 'att1', path: '/private/test', max_bytes: 20 });
+    assert.equal(exported.mime_type, 'application/octet-stream');
+    assert.equal(exported.warning, read.attachments[0].warning);
+    assert.equal(saves, 1);
+  } finally { delete global.Path; }
+  for (const number of [-1743, -1728]) {
+    messages[0].mailAttachments = collection([{ ...attachment,
+      mimeType: () => { throw Object.assign(new Error('Denied or stale'), { errorNumber: number }); } }]);
+    assert.throws(() => dispatch(mail, 'read_message', { ref, max_chars: 4 }), /Denied or stale/);
+  }
+});
+
+test('zero outgoing IDs can be saved, replied and shown without accepting ambiguous drafts', () => {
+  const { mail, ref } = fixture();
+  const { saved, drafts } = composing(mail);
+  const make = mail.OutgoingMessage;
+  mail.OutgoingMessage = (properties) => { const draft = make(properties); draft.id = 0; return draft; };
+  const args = { account_id: 'a1', sender: 'me@example.com', to: ['you@example.com'],
+    cc: [], bcc: [], subject: 'Test', body: 'Body' };
+  assert.equal(dispatch(mail, 'create_draft', args).draft_id, 0);
+  assert.equal(saved.length, 1);
+  mail.activate = () => {};
+  const show = { account_id: 'a1', sender: args.sender, draft_id: 0 };
+  assert.equal(dispatch(mail, 'show_draft', show).shown, true);
+  mail.reply = () => mail.OutgoingMessage({ content: 'Quote', sender: args.sender });
+  assert.equal(dispatch(mail, 'reply_draft', { ref, sender: args.sender, body: 'Reply', reply_all: false }).draft_id, 0);
+  mail.outgoingMessages = collection([drafts[0], drafts[0]]);
+  assert.throws(() => dispatch(mail, 'show_draft', show), /ambiguous/);
+  assert.throws(() => dispatch(mail, 'show_draft', { ...show, draft_id: -1 }), /Invalid/);
+});
+
 test('creates and saves only a draft using an explicit account sender', () => {
   const { mail } = fixture();
   const { saved, drafts } = composing(mail);

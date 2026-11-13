@@ -39,14 +39,21 @@ def selected_sender(bridge, account_id: str, sender: str) -> str:
 def perform_write(bridge, directory: Path, operation: str, arguments: dict) -> dict:
     with write_lock(directory):
         marker = directory / "write-uncertain"
+        recovery = (
+            f"Stop all mail-app-mcp processes. Inspect Mail and allow pending operations to finish. "
+            f"Only after establishing the outcome, remove only {str(marker)!r}; keep writes.lock. "
+            "Restart the server and rediscover affected messages. Do not blindly retry draft creation; "
+            "it can create duplicates. If the outcome is still unknown, leave the marker in place."
+        )
         if os.path.lexists(marker):
-            raise ValueError("A previous write has an uncertain outcome. Inspect Mail and clear the write-uncertain marker before another write.")
+            raise ValueError(f"A previous write has an uncertain outcome. This call attempted no new write. {recovery}")
         fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         os.close(fd)
         try:
             result = bridge.call(operation, arguments)
-        except OutcomeUnknown:
-            raise
+        except OutcomeUnknown as exc:
+            raise OutcomeUnknown(f"{exc} {recovery}", operation=exc.operation,
+                                 apple_script_error_number=exc.apple_script_error_number) from exc
         except Exception:
             # Validation failures from the fixed script have no side effects.
             marker.unlink()
@@ -139,7 +146,7 @@ def create_server(settings: Settings | None = None, bridge=None, state_dir: Path
         return perform_write(mail, directory, "show_message", {"ref": ref.model_dump(mode="json")})
 
     @tool(WRITE)
-    def show_draft(account_id: Identifier, draft_id: Annotated[int, Field(strict=True, gt=0, le=2**53 - 1)],
+    def show_draft(account_id: Identifier, draft_id: Annotated[int, Field(strict=True, ge=0, le=2**53 - 1)],
                    sender: Address) -> dict:
         """Show a currently available outgoing draft by ID and verified account sender. Closed/reloaded drafts may have stale IDs."""
         selected_sender(mail, account_id, sender)

@@ -107,6 +107,8 @@ Mail does not provide an atomic snapshot through scripting. New mail can arrive 
 
 Returns `ref`, `subject`, `sender`, `to`, `cc`, `body`, `truncated`, and `attachments`. Recipient fields are arrays of addresses. Each attachment has `attachment_id`, `name`, `mime_type`, `size`, and `downloaded`. The size comes from Mail's approximate metadata; attachment extraction checks actual exported bytes too. `truncated: true` means the returned body is incomplete. This limit bounds the returned text, not how much text Mail may load internally.
 
+If Mail's attachment MIME-type getter fails with AppleEvent error `-10000`, that attachment reports `mime_type: "application/octet-stream"` and a `warning`. The message body and other metadata remain readable. Other getter errors still fail the call.
+
 Reading requires a known, positive Mail-reported message size no greater than 20 MiB before loading the body. This is the reported message size, which can include attachments, rather than the requested output length. An unknown or oversized message must be read manually in Mail.
 
 ## read_attachment
@@ -127,6 +129,8 @@ Returns `name`, `mime_type`, `size` (actual exported bytes), `untrusted: true`, 
 Every export must already be downloaded in Mail and fit the 10 MiB attachment limit. PDF parsing runs in a subprocess with a 10-second parent-enforced timeout and a 5-second CPU limit. A macOS watchdog samples peak resident memory every 20 milliseconds and terminates the worker above 512 MiB; allocation can overshoot between samples. This is not a hard memory cap or a security sandbox. Resource limits can reject a valid but expensive PDF. There is no password input.
 
 The server chooses a private temporary path and removes the export after processing. It accepts no path, URL, or upload, and returns no filesystem path or reusable handle. Attachment content, filenames, and MIME metadata remain untrusted.
+
+When Mail cannot supply MIME metadata (`-10000`), extraction returns the same warning and bounded base64, subject to the 1 MiB binary limit. It does not infer a type from the filename; PDF/text extraction requires available MIME metadata.
 
 ## create_draft
 
@@ -197,7 +201,7 @@ Returns `{"shown": true}`. Like other operations with side effects, this tool ob
 | Argument | Required | Meaning |
 | --- | --- | --- |
 | `account_id` | Yes | Exact account ID returned by draft creation. |
-| `draft_id` | Yes | Positive integer ID up to 2⁵³ − 1 returned by `create_draft` or `reply_draft`. |
+| `draft_id` | Yes | Nonnegative integer ID from 0 to 2⁵³ − 1 returned by `create_draft` or `reply_draft`. Mail can assign outgoing draft ID `0`. |
 | `sender` | Yes | Exact sender returned by draft creation. |
 
 Shows the identified outgoing draft in Mail and may bring Mail forward. The account and sender must still validate. A draft ID only refers to a currently available outgoing draft; it can become stale after a window closes or Mail restarts. Failure to find it is an ordinary tool error. Locate the draft manually in Mail instead of creating a duplicate. This tool cannot edit or send the draft, open an arbitrary file, or follow a URL.
