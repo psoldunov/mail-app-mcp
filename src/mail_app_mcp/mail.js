@@ -537,6 +537,9 @@ function draftResult(mail, copy, expected) {
   }
 }
 
+// Drafts are composed hidden although Mail keeps a hidden session until it quits: only a session that starts
+// visible closes by script, and scripting a visible editor is unsafe. Reading a visible reply's content hung
+// Mail's main thread until force quit, and a visible reply ignores content set 0.5 s after it opens.
 function createDraft(mail, args) {
   verifySender(mail, args.account_id, args.sender);
   var expected = { account_id: args.account_id, sender: args.sender, subject: args.subject, body: args.body,
