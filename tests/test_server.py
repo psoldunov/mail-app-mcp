@@ -100,7 +100,7 @@ def test_invalid_trash_discovery_never_attempts_write(tmp_path, discovered):
     with pytest.raises(Exception):
         call(create_server(bridge=mail, state_dir=tmp_path), "trash_message", {"ref": REF})
     assert not mail.requests
-    assert not (tmp_path / "write-uncertain").exists()
+    assert not list(tmp_path.glob("write-uncertain*"))
 
 
 def test_read_message_preserves_html_link_targets_without_exposing_source(tmp_path):
@@ -219,6 +219,22 @@ def test_unknown_write_outcome_blocks_following_writes(tmp_path):
     assert len(mail.requests) == 1
 
 
+def test_uncertainty_is_isolated_to_the_server_session(tmp_path):
+    mail = FixtureMail()
+    first = create_server(bridge=mail, state_dir=tmp_path)
+    second = create_server(bridge=mail, state_dir=tmp_path)
+    mail.fail_write = True
+    with pytest.raises(Exception, match="retry"):
+        call(first, "set_message_status", {"ref": REF, "read": True})
+    mail.fail_write = False
+    assert call(second, "set_message_status", {"ref": REF, "read": False})
+    with pytest.raises(Exception, match="uncertain"):
+        call(first, "set_message_status", {"ref": REF, "read": False})
+    restarted = create_server(bridge=mail, state_dir=tmp_path)
+    assert call(restarted, "set_message_status", {"ref": REF, "read": True})
+    assert len(mail.requests) == 3
+
+
 def test_uncertain_write_errors_explain_manual_recovery_and_reads_still_work(tmp_path):
     mail = FixtureMail()
     server = create_server(bridge=mail, state_dir=tmp_path)
@@ -226,17 +242,18 @@ def test_uncertain_write_errors_explain_manual_recovery_and_reads_still_work(tmp
     with pytest.raises(Exception) as initial:
         call(server, "set_message_status", {"ref": REF, "read": True})
     mail.fail_write = False
-    restarted = create_server(bridge=mail, state_dir=tmp_path)
     with pytest.raises(Exception) as blocked:
-        call(restarted, "set_message_status", {"ref": REF, "read": False})
+        call(server, "set_message_status", {"ref": REF, "read": False})
     for error in (initial, blocked):
         assert str(tmp_path / "write-uncertain") in str(error.value)
         assert "Inspect Mail" in str(error.value)
         assert "mail-app-mcp --clear-uncertain" in str(error.value)
         assert "writes.lock" in str(error.value)
+        assert "only in this MCP server session" in str(error.value)
+        assert "does not confirm or cancel" in str(error.value)
     assert len(mail.requests) == 1
-    assert call(restarted, "read_message", {"ref": REF})["operation"] == "read_message"
-    assert (tmp_path / "write-uncertain").exists()
+    assert call(server, "read_message", {"ref": REF})["operation"] == "read_message"
+    assert len(list(tmp_path.glob("write-uncertain-*"))) == 1
 
 
 def test_uncertain_marker_records_and_reports_what_was_attempted(tmp_path):
@@ -245,7 +262,8 @@ def test_uncertain_marker_records_and_reports_what_was_attempted(tmp_path):
     mail.fail_write = True
     with pytest.raises(Exception):
         call(server, "set_message_status", {"ref": REF, "read": True})
-    record = json.loads((tmp_path / "write-uncertain").read_text())
+    marker, = tmp_path.glob("write-uncertain-*")
+    record = json.loads(marker.read_text())
     assert record["operation"] == "set_message_status"
     assert record["target"] == REF
     assert record["pid"] > 0 and record["started_at"] and record["build"]
@@ -256,12 +274,12 @@ def test_uncertain_marker_records_and_reports_what_was_attempted(tmp_path):
     assert '"message_id": 7' in str(blocked.value)
 
 
-def test_legacy_empty_marker_still_blocks_and_says_it_has_no_details(tmp_path):
+def test_legacy_marker_is_preserved_but_does_not_block_new_sessions(tmp_path):
     (tmp_path / "write-uncertain").touch(mode=0o600)
     tmp_path.chmod(0o700)
     server = create_server(bridge=FixtureMail(), state_dir=tmp_path)
-    with pytest.raises(Exception, match="no details recorded"):
-        call(server, "set_message_status", {"ref": REF, "read": True})
+    assert call(server, "set_message_status", {"ref": REF, "read": True})
+    assert (tmp_path / "write-uncertain").exists()
 
 
 def test_owner_clears_the_marker_from_the_command_line(tmp_path, monkeypatch, capsys):
@@ -272,14 +290,25 @@ def test_owner_clears_the_marker_from_the_command_line(tmp_path, monkeypatch, ca
     module.main()
     assert "No uncertain write" in capsys.readouterr().out
     mail = FixtureMail()
+    servers = [create_server(bridge=mail, state_dir=tmp_path) for _ in range(2)]
     mail.fail_write = True
-    with pytest.raises(Exception):
-        call(create_server(bridge=mail, state_dir=tmp_path), "set_message_status", {"ref": REF, "read": True})
+    for server in servers:
+        with pytest.raises(Exception):
+            call(server, "set_message_status", {"ref": REF, "read": True})
+    (tmp_path / "write-uncertain").touch(mode=0o600)
+    unrelated = tmp_path / "owner-notes"
+    unrelated.write_text("keep")
+    lock_inode = (tmp_path / "writes.lock").stat().st_ino
     module.main()
-    assert '"operation": "set_message_status"' in capsys.readouterr().out
-    assert not (tmp_path / "write-uncertain").exists()
+    output = capsys.readouterr().out
+    assert output.count('"operation": "set_message_status"') == 2
+    assert "no details recorded" in output
+    assert not list(tmp_path.glob("write-uncertain*"))
+    assert unrelated.read_text() == "keep"
+    assert (tmp_path / "writes.lock").stat().st_ino == lock_inode
     mail.fail_write = False
-    assert call(create_server(bridge=mail, state_dir=tmp_path), "set_message_status", {"ref": REF, "read": True})
+    for server in servers:
+        assert call(server, "set_message_status", {"ref": REF, "read": True})
 
 
 def test_show_message_is_serialized_but_never_marks_or_waits_on_uncertainty(tmp_path):
@@ -288,7 +317,7 @@ def test_show_message_is_serialized_but_never_marks_or_waits_on_uncertainty(tmp_
     mail.fail_write = True
     with pytest.raises(Exception):
         call(server, "show_message", {"ref": REF})
-    assert not (tmp_path / "write-uncertain").exists()
+    assert not list(tmp_path.glob("write-uncertain*"))
     with pytest.raises(Exception):
         call(server, "set_message_status", {"ref": REF, "read": True})
     mail.fail_write = False
@@ -394,7 +423,7 @@ def test_denied_move_explains_allowed_paths_without_attempting_a_write(tmp_path)
     with pytest.raises(Exception, match=r"Configured destinations: \[\]"):
         call(server, "move_message", {"ref": {**REF, "account_id": "personal"}, "destination": ["Inbox"]})
     assert not mail.requests
-    assert not (tmp_path / "write-uncertain").exists()
+    assert not list(tmp_path.glob("write-uncertain*"))
 
 
 def test_known_rejection_does_not_poison_write_lock(tmp_path):
