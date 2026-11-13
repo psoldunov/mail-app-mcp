@@ -134,10 +134,13 @@ function boxFor(mail, accountId, path) {
 
 function messageFor(mail, ref) {
   var box = boxFor(mail, ref.account_id, ref.mailbox);
-  var message = one(box.messages.whose({ id: ref.message_id })(), 'Message');
+  var rediscover = '; call list_messages again and use the fresh ref. Draft autosave can change both IDs';
+  var matches = box.messages.whose({ id: ref.message_id })();
+  requireValue(matches.length === 1, 'Message missing or ambiguous' + rediscover);
+  var message = matches[0];
   requireValue(message.id() === ref.message_id && message.messageId() === ref.header_message_id,
-    'Message reference is stale');
-  requireValue(sameBox(message.mailbox(), ref.account_id, ref.mailbox), 'Message mailbox is stale');
+    'Message reference is stale' + rediscover);
+  requireValue(sameBox(message.mailbox(), ref.account_id, ref.mailbox), 'Message mailbox is stale' + rediscover);
   return message;
 }
 
@@ -438,6 +441,11 @@ function replyDraft(mail, args) {
   var message = messageFor(mail, args.ref);
   rejectUnsafeBox(mail, message.mailbox(), false);
   verifySender(mail, args.ref.account_id, args.sender);
+  // Drafts can also appear under Gmail's canonical All Mail mailbox.
+  var drafts = mail.draftsMailbox().messages.whose({ id: args.ref.message_id })();
+  requireValue(!drafts.some(function (draft) {
+    return boxIdentity(draft.mailbox()).account_id === args.ref.account_id;
+  }), 'Cannot reply to a saved draft. Select a received message, or use create_draft for a new draft');
   checkBodySize(message);
   return mutation(function () {
     var draft = mail.reply(message, { openingWindow: false, replyToAll: args.reply_all });

@@ -360,6 +360,33 @@ test('creates and saves only a draft using an explicit account sender', () => {
   assert.equal(saved[0].bccRecipients()[0].address(), 'bcc@example.com');
 });
 
+test('expired references explain rediscovery after draft autosave without reading another message', () => {
+  const { mail, ref, messages } = fixture();
+  const args = { ref, max_chars: 100 };
+  assert.throws(() => dispatch(mail, 'read_message', {
+    ...args, ref: { ...ref, message_id: 99 },
+  }), /Message missing or ambiguous.*list_messages.*autosave/);
+  messages[0].messageId = 'autosaved@example.com';
+  assert.throws(() => dispatch(mail, 'read_message', args), /stale.*list_messages.*autosave/);
+});
+
+test('reply rejects saved drafts, including canonical All Mail references, before mutation', () => {
+  for (const canonical of [false, true]) {
+    const { mail, draftbox, archive, messages, ref } = fixture();
+    const { saved } = composing(mail);
+    const box = canonical ? archive : draftbox;
+    messages[0].mailbox = box;
+    box.messages = collection(messages);
+    draftbox.messages = collection(messages);
+    mail.reply = () => assert.fail('Native reply must not run for a saved draft');
+    const source = { ...ref, mailbox: [box.name()] };
+    assert.throws(() => dispatch(mail, 'reply_draft', {
+      ref: source, sender: 'me@example.com', body: 'Reply', reply_all: true,
+    }), /^Error: Cannot reply to a saved draft.*received message/);
+    assert.equal(saved.length, 0);
+  }
+});
+
 test('native reply preserves original content and saves without sending', () => {
   const { mail, ref, messages } = fixture();
   const { saved } = composing(mail);
@@ -377,6 +404,21 @@ test('native reply preserves original content and saves without sending', () => 
     { draft_id: 42, account_id: 'a1', sender: 'me@example.com', status: 'draft' });
   assert.equal(saved[0].content(), 'My reply\n\nOriginal reply content');
   assert.equal(saved[0].sender(), 'me@example.com');
+});
+
+test('draft membership is account-scoped and a failed lookup cannot create a reply', () => {
+  const { mail, ref, draftbox } = fixture();
+  const { saved } = composing(mail);
+  const otherAccount = scripting({ id: 'a2' });
+  const otherBox = scripting({ name: 'Drafts', account: otherAccount, container: null });
+  draftbox.messages = collection([scripting({ id: ref.message_id, mailbox: otherBox })]);
+  mail.reply = () => mail.OutgoingMessage({ content: 'Quote', sender: 'me@example.com' });
+  const args = { ref, sender: 'me@example.com', body: 'Reply', reply_all: false };
+  assert.equal(dispatch(mail, 'reply_draft', args).status, 'draft');
+  assert.equal(saved.length, 1);
+  mail.draftsMailbox = () => { throw new Error('Drafts unavailable'); };
+  assert.throws(() => dispatch(mail, 'reply_draft', args), /^Error: Drafts unavailable$/);
+  assert.equal(saved.length, 1);
 });
 
 function runtime(request, processes, application, options = {}) {
