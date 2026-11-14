@@ -5,6 +5,10 @@ still holds each message about to be returned and supplies the header Message-ID
 check refs against. Whenever the two disagree, the search is rerun as a scan through Mail.
 """
 
+import base64
+import binascii
+import hashlib
+import json
 import logging
 import os
 import sqlite3
@@ -69,6 +73,65 @@ def label_rank(path: tuple[str, ...]) -> int:
     return 0 if name == "inbox" else 2 if name == "all mail" else 1
 
 
+def account_order(account: str) -> tuple[bool, str]:
+    """Equal dates order by account as the scan does: On My Mac first, then account ID."""
+    return account != LOCAL, account
+
+
+def query_digest(args: dict) -> str:
+    """A cursor continues only the search it came from: the same sender text, scope and sort."""
+    fields = [args[key] for key in ("from", "account_id", "mailbox", "sort")]
+    return hashlib.sha256(json.dumps(fields).encode()).hexdigest()[:16]
+
+
+def resume_point(args: dict, cursor: str | None) -> list | None:
+    """The (timestamp in ms, account ID, Mail ID) of the last message a previous page returned."""
+    if cursor is None:
+        return None
+    try:
+        data = json.loads(base64.b64decode(cursor, altchars=b"-_", validate=True))
+        stamp, account, message_id = data["after"]
+        valid = (type(data["q"]) is str and type(stamp) is int and abs(stamp) <= 2**53 - 1
+                 and type(account) is str and 0 < len(account) <= 512
+                 and type(message_id) is int and 1 <= message_id <= 2**53 - 1)
+    except (binascii.Error, UnicodeDecodeError, ValueError, TypeError, KeyError):
+        valid = False
+    if not valid:
+        raise ValueError("cursor is not one search_messages returned; start again without cursor")
+    if data["q"] != query_digest(args):
+        raise ValueError("cursor belongs to a different search; repeat its from, account_id, mailbox and sort, "
+                         "or start again without cursor")
+    return [stamp, account, message_id]
+
+
+def next_cursor(args: dict, result: dict) -> str | None:
+    """Continues after the last message returned, so mail arriving between pages neither repeats nor skips one."""
+    if not result.get("has_more") or not result.get("messages"):
+        return None
+    last = result["messages"][-1]
+    stamp = round(datetime.fromisoformat(last["date_received"]).timestamp() * 1000)
+    after = [stamp, last["ref"]["account_id"], last["ref"]["message_id"]]
+    return base64.urlsafe_b64encode(json.dumps({"q": query_digest(args), "after": after}).encode()).decode()
+
+
+def after_clause(after: list | None, newest: bool, accounts: list[str]) -> tuple[str, list]:
+    """Rows strictly past the cursor in ORDER BY date_received, account_rank, ROWID order."""
+    if after is None:
+        return "", []
+    stamp, account, rowid = after
+    # Ranks are positions among this search's accounts, so place the cursor's account even if it has left them.
+    later = sum(account_order(other) <= account_order(account) for other in accounts)
+    same = later - 1 if account in accounts else -1
+    onward = "<" if newest else ">"
+    # The whole-second bound lets SQLite seek its date index instead of walking every earlier page.
+    # shortcut: a NULL date is never past a cursor, so later pages skip the check that sends such a store to the
+    # scan; no NULL date seen on a real store yet, add "OR m.date_received IS NULL" for newest if one appears.
+    return (f" AND m.date_received {onward}= ? AND (m.date_received * 1000 {onward} ?"
+            f" OR (m.date_received * 1000 = ? AND (scope.account_rank >= ?"
+            f" OR (scope.account_rank = ? AND m.ROWID {onward} ?))))",
+            [stamp // 1000, stamp, stamp, later, same, rowid])
+
+
 def nominate(connection: sqlite3.Connection, args: dict) -> dict:
     account_id, wanted = args["account_id"], args["mailbox"]
     boxes = {rowid: box for rowid, box in mailboxes(connection).items() if account_id in (None, box[1])}
@@ -79,13 +142,13 @@ def nominate(connection: sqlite3.Connection, args: dict) -> dict:
         raise IndexUnavailable("the index does not hold the requested account or mailbox")
     if not all(scheme for scheme, _, _ in boxes.values()):
         raise IndexUnavailable("the search covers a mailbox whose kind index search does not handle yet")
-    # Equal dates order by account as the scan does: On My Mac first, then account ID.
-    accounts = sorted({box[1] for box in boxes.values()}, key=lambda account: (account != LOCAL, account))
+    accounts = sorted({box[1] for box in boxes.values()}, key=account_order)
     needle = args["from"].lower()
     connection.create_function(
         "sender_matches", 2, lambda comment, address: needle in sender_text(comment, address).lower(),
         deterministic=True)
     direction = "DESC" if args["sort"] == "newest" else "ASC"
+    after, after_values = after_clause(args["after"], args["sort"] == "newest", accounts)
     # shortcut: SQLite walks messages in date order, so a sender with few or no matches reads every row
     # (about 1 s per million messages); count the matches first and start from the sender index if stores get there.
     rows = connection.execute(
@@ -97,9 +160,10 @@ def nominate(connection: sqlite3.Connection, args: dict) -> dict:
         " WHERE m.deleted = 0"
         + (" AND m.sender IN (SELECT ROWID FROM addresses WHERE sender_matches(comment, address))" if needle else "")
         + (" AND (m.mailbox = ? OR m.ROWID IN (SELECT message_id FROM labels WHERE mailbox_id = ?))" if scoped else "")
+        + after
         + f" ORDER BY m.date_received {direction}, scope.account_rank, m.ROWID {direction} LIMIT ?",
         [value for rowid, box in boxes.items() for value in (rowid, accounts.index(box[1]))]
-        + ([target, target] if scoped else []) + [args["limit"] + 1]).fetchall()
+        + ([target, target] if scoped else []) + after_values + [args["limit"] + 1]).fetchall()
     chosen = rows[:args["limit"]]
     if not all(type(row[2]) is int for row in chosen):
         raise IndexUnavailable("the index holds a message without a received date")
@@ -136,8 +200,12 @@ def confirmed(bridge, messages: list[dict]) -> list[dict]:
              "ref": {**item["ref"], "header_message_id": header}} for item, header in zip(messages, headers)]
 
 
-def search(bridge, mail_data: Path | None, args: dict) -> dict:
-    """Answer from the index when it can be read and Mail agrees; otherwise scan through Mail as before."""
+def search(bridge, mail_data: Path | None, args: dict, cursor: str | None = None) -> dict:
+    """Answer from the index when it can be read and Mail agrees; otherwise scan through Mail as before.
+
+    Both continue after the cursor's message by the same order, so either can serve any page.
+    """
+    args = {**args, "after": resume_point(args, cursor)}
     started = time.monotonic()
     try:
         try:
@@ -149,9 +217,11 @@ def search(bridge, mail_data: Path | None, args: dict) -> dict:
         messages = confirmed(bridge, found["messages"])
     except IndexUnavailable as exc:
         log.info("search_messages scans through Mail: %s", exc)
-        return {**bridge.call("search_messages", args), "backend": "scan", "index_unavailable": str(exc)}
+        scanned = bridge.call("search_messages", args)
+        return {**scanned, "next_cursor": next_cursor(args, scanned), "backend": "scan", "index_unavailable": str(exc)}
     done = time.monotonic()
-    return {"messages": messages, "complete": True, "has_more": found["has_more"], "sort": args["sort"],
+    page = {"messages": messages, "has_more": found["has_more"]}
+    return {**page, "next_cursor": next_cursor(args, page), "complete": True, "sort": args["sort"],
             "mailboxes_searched": found["mailboxes_searched"], "backend": "index",
             "timing_ms": {"index": round((indexed - started) * 1000), "confirm": round((done - indexed) * 1000),
                           "total": round((done - started) * 1000)}}

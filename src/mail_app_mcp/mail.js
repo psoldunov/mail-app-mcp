@@ -54,7 +54,9 @@ function validate(operation, args) {
     requireValue(typeof args.from === 'string' && args.from.length <= 1000 &&
       ['newest', 'oldest'].indexOf(args.sort) !== -1 && integer(args.limit, 1, 100) &&
       (args.account_id == null || string(args.account_id)) &&
-      (args.mailbox == null || (string(args.account_id) && validPath(args.mailbox))), 'Invalid global search');
+      (args.mailbox == null || (string(args.account_id) && validPath(args.mailbox))) &&
+      (args.after == null || (Array.isArray(args.after) && args.after.length === 3 && Number.isSafeInteger(args.after[0]) &&
+        string(args.after[1]) && integer(args.after[2], 1, Number.MAX_SAFE_INTEGER))), 'Invalid global search');
   }
   if (operation === 'confirm_messages') {
     requireValue(Array.isArray(args.messages) && args.messages.length >= 1 && args.messages.length <= 100 &&
@@ -341,12 +343,15 @@ function searchMessages(mail, args) {
     requireValue(previous.timestamp === candidate.timestamp, 'Duplicate message dates changed; retry search');
     return false;
   });
-  var ordered = unique.slice().sort(function (a, b) {
+  var order = function (a, b) {
     var dateOrder = args.sort === 'newest' ? b.timestamp - a.timestamp : a.timestamp - b.timestamp;
     // Within one account, a higher Mail ID arrived later, so it breaks a received-time tie.
     return dateOrder || a.scope.account_id.localeCompare(b.scope.account_id) ||
       (args.sort === 'newest' ? b.id - a.id : a.id - b.id);
-  });
+  };
+  // A later page keeps only what sorts after the previous page's last message, in the index's order too.
+  var after = args.after && { timestamp: args.after[0], scope: { account_id: args.after[1] }, id: args.after[2] };
+  var ordered = unique.slice().sort(order).filter(function (candidate) { return !after || order(after, candidate) < 0; });
   searchDeadline(deadline);
   var filtered = Date.now();
   var found = [];

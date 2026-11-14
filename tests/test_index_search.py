@@ -1,5 +1,7 @@
 """search_messages answered from a made-up copy of Mail's index, with Mail replaced by a fake."""
 
+import base64
+import json
 import sqlite3
 from datetime import datetime
 
@@ -37,6 +39,15 @@ def make_index(root, messages, labels=(), boxes=BOXES):
         CREATE TABLE labels (message_id INTEGER, mailbox_id INTEGER, PRIMARY KEY(message_id, mailbox_id)) WITHOUT ROWID;
     """)
     db.executemany("INSERT INTO mailboxes VALUES (?, ?)", boxes.items())
+    db.executemany("INSERT INTO labels VALUES (?, ?)", labels)
+    db.commit()
+    db.close()
+    return arrive(root, messages)
+
+
+def arrive(root, messages):
+    """Adds messages to an index made by make_index, as Mail does while it runs."""
+    db = sqlite3.connect(root / "V10" / "MailData" / "Envelope Index")
     for rowid, box, name, address, subject, received, read, flagged, deleted in messages:
         db.execute("INSERT OR IGNORE INTO addresses (address, comment) VALUES (?, ?)", (address, name))
         db.execute("INSERT OR IGNORE INTO subjects (subject) VALUES (?)", (subject,))
@@ -45,7 +56,6 @@ def make_index(root, messages, labels=(), boxes=BOXES):
             " (SELECT ROWID FROM subjects WHERE subject = ?), ?, ?, ?, ?, ?)",
             (rowid, address, name, subject, int(datetime.fromisoformat(received).timestamp()), box,
              read, flagged, deleted))
-    db.executemany("INSERT INTO labels VALUES (?, ?)", labels)
     db.commit()
     db.close()
     return root
@@ -94,7 +104,8 @@ def test_newest_sender_match_across_accounts_comes_from_the_index(tmp_path):
 
 
 ISABEL = (10, 4, "Isabel Ortiz", "isabel@example.org", "Hello", "2026-11-01T10:00:00+00:00", 0, 0, 0)
-SCAN_REQUEST = ("search_messages", {"from": "isabel", "sort": "newest", "limit": 1, "account_id": None, "mailbox": None})
+SCAN_REQUEST = ("search_messages", {"from": "isabel", "sort": "newest", "limit": 1, "account_id": None, "mailbox": None,
+                                    "after": None})
 
 
 def test_without_a_usable_index_mail_scans_as_before_and_says_why(tmp_path):
@@ -219,3 +230,84 @@ def test_from_matches_the_sender_text_mail_shows_without_regard_to_case(tmp_path
     for needle, expected in (("acme, inc", [50]), ('inc." <billing', [50]), ("BARE@", [51]), ("ÉMILE", [52]),
                              ("zola <emile", [52]), ("example", [52, 51, 50]), ("%", []), ("_", [])):
         assert ids(call(server, "search_messages", {"from": needle})) == expected, needle
+
+
+SAME = "2026-11-05T00:00:00+00:00"
+# Four messages share one received time across On My Mac (33), WORK (31, 32) and HOME (39).
+TIED = [stored(39, 4, SAME), stored(31, 1, SAME), stored(32, 1, SAME), stored(33, 5, SAME),
+        stored(34, 1, "2026-11-06T00:00:00+00:00")]
+
+
+def pages(server, arguments):
+    """Follows next_cursor until the last page; returns each page's Mail IDs."""
+    found, cursor = [], None
+    for _ in range(10):
+        page = call(server, "search_messages", {**arguments, **({"cursor": cursor} if cursor else {})})
+        found.append(ids(page))
+        assert (page["next_cursor"] is not None) == page["has_more"]
+        cursor = page["next_cursor"]
+        if cursor is None:
+            return found
+    pytest.fail("next_cursor never ran out")
+
+
+@pytest.mark.parametrize("sort, expected", [("newest", [[34, 33], [32, 31], [39]]),
+                                            ("oldest", [[33, 31], [32, 39], [34]])])
+def test_pages_follow_next_cursor_with_no_overlap_or_gap_through_equal_dates(tmp_path, sort, expected):
+    server = create_server(bridge=FakeMail(), state_dir=tmp_path / "state", mail_data=make_index(tmp_path / "Mail", TIED))
+    assert pages(server, {"sort": sort, "limit": 2}) == expected
+    assert sum(expected, []) == ids(call(server, "search_messages", {"sort": sort, "limit": 10}))
+
+
+def test_mail_arriving_between_pages_neither_repeats_nor_skips_a_message(tmp_path):
+    index = make_index(tmp_path / "Mail", TIED)
+    server = create_server(bridge=FakeMail(), state_dir=tmp_path / "state", mail_data=index)
+    first = call(server, "search_messages", {"limit": 2})
+    assert ids(first) == [34, 33]
+    # A newer message would push an offset page back by one; one dated like the cursor but sorting after it is still due.
+    arrive(index, [stored(40, 1, "2026-11-07T00:00:00+00:00"), stored(41, 4, SAME)])
+    assert ids(call(server, "search_messages", {"limit": 1})) == [40]
+    second = call(server, "search_messages", {"limit": 2, "cursor": first["next_cursor"]})
+    assert ids(second) == [32, 31]
+    third = call(server, "search_messages", {"limit": 2, "cursor": second["next_cursor"]})
+    assert ids(third) == [41, 39] and third["has_more"] is False and third["next_cursor"] is None
+
+
+def test_a_cursor_only_continues_the_search_it_came_from(tmp_path):
+    mail = FakeMail()
+    server = create_server(bridge=mail, state_dir=tmp_path / "state", mail_data=make_index(tmp_path / "Mail", TIED))
+    query = {"from": "isabel", "sort": "newest", "account_id": WORK}
+    cursor = call(server, "search_messages", {**query, "limit": 1})["next_cursor"]
+    asked = len(mail.requests)
+    for changed in ({"from": "Isabel"}, {"from": ""}, {"sort": "oldest"}, {"account_id": HOME},
+                    {"mailbox": ["[Gmail]", "All Mail"]}):
+        with pytest.raises(Exception, match="different search"):
+            call(server, "search_messages", {**query, **changed, "cursor": cursor})
+    forged = [base64.urlsafe_b64encode(json.dumps(data).encode()).decode() for data in (
+        {"q": "x", "after": [1, WORK]}, {"q": "x", "after": [True, WORK, 1]}, {"q": "x", "after": [1, WORK, 0]}, [1])]
+    for bad in ("", "not a cursor", cursor[:-6], *forged):
+        with pytest.raises(Exception, match="not one search_messages returned"):
+            call(server, "search_messages", {**query, "cursor": bad})
+    assert len(mail.requests) == asked
+    # The same search continues, with any limit.
+    assert ids(call(server, "search_messages", {**query, "limit": 5, "cursor": cursor})) == [32, 31]
+
+
+def test_the_scan_continues_from_an_index_cursor_and_hands_back_one_the_index_continues(tmp_path):
+    class Scanning(FakeMail):
+        def call(self, operation, args):
+            self.requests.append((operation, args))
+            return {"messages": [{"ref": {"account_id": WORK, "mailbox": ["[Gmail]", "All Mail"], "message_id": 32,
+                                          "header_message_id": "header-32"}, "date_received": "2026-11-05T00:00:00.000Z"}],
+                    "complete": True, "has_more": True, "sort": args["sort"]}
+
+    indexed = create_server(bridge=FakeMail(), state_dir=tmp_path / "state", mail_data=make_index(tmp_path / "Mail", TIED))
+    first = call(indexed, "search_messages", {"limit": 2})
+    mail = Scanning()
+    scanned = create_server(bridge=mail, state_dir=tmp_path / "state", mail_data=None)
+    second = call(scanned, "search_messages", {"limit": 1, "cursor": first["next_cursor"]})
+    stamp = int(datetime.fromisoformat(SAME).timestamp()) * 1000
+    assert mail.requests == [("search_messages", {"from": "", "sort": "newest", "limit": 1, "account_id": None,
+                                                  "mailbox": None, "after": [stamp, "__local__", 33]})]
+    assert second["backend"] == "scan" and ids(second) == [32]
+    assert ids(call(indexed, "search_messages", {"limit": 5, "cursor": second["next_cursor"]})) == [31, 39]
