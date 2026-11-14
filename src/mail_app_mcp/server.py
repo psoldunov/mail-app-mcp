@@ -201,18 +201,23 @@ def create_server(settings: Settings | None = None, bridge=None, state_dir: Path
     @tool(READ)
     def search_messages(sender: Annotated[str, Field(validation_alias="from", max_length=1000)] = "",
                         sort: Literal["newest", "oldest"] = "newest", limit: Limit = 50,
-                        account_id: Identifier | None = None, mailbox: Mailbox | None = None) -> dict:
+                        account_id: Identifier | None = None, mailbox: Mailbox | None = None,
+                        cursor: Annotated[str, Field(max_length=1000)] | None = None) -> dict:
         """Search all accounts/mailboxes by literal sender (from), sorted by received date before limit.
 
         Optional account_id/mailbox narrows scope. complete means all matching headers were considered;
-        has_more means additional results exist. backend says how it ran: index (Mail's own index, fast) or
-        scan (read through Mail, slow; index_unavailable says why). A scan that cannot finish in 35 seconds
-        fails, never claims latest; pass account_id (and mailbox) then.
+        has_more means additional results exist. For the next page pass next_cursor as cursor with the same
+        from, account_id, mailbox and sort (limit may change). A page continues after the last message returned,
+        so mail arriving between pages causes no repeats or gaps; mail newer than that message appears only in
+        a fresh newest search. A cursor from another search is rejected.
+        backend says how it ran: index (Mail's own index, fast) or scan (read through Mail, slow;
+        index_unavailable says why); both honor cursor. A scan that cannot finish in 35 seconds fails, never
+        claims latest; pass account_id (and mailbox) then.
         """
         if mailbox is not None and account_id is None:
             raise ValueError("mailbox requires account_id")
         return search(mail, mail_data, {"from": sender, "sort": sort, "limit": limit,
-            "account_id": account_id, "mailbox": list(mailbox) if mailbox is not None else None})
+            "account_id": account_id, "mailbox": list(mailbox) if mailbox is not None else None}, cursor)
 
     @tool(READ)
     def read_message(ref: MessageRef, max_chars: TextLimit = 50_000) -> dict:

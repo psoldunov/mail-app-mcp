@@ -1186,6 +1186,33 @@ test('a received-time tie puts the higher Mail ID first for newest and last for 
   assert.deepEqual(ids('oldest'), [1, 2]);
 });
 
+test('a scan continues after the previous page by the order it sorts in, never from the top', () => {
+  const first = fixture(3);
+  const second = fixture();
+  second.account.id = 'a2';
+  second.messages[0].id = 7;
+  const mail = { ...first.mail, accounts: collection([first.account, second.account]) };
+  const stamp = Date.parse('2026-01-02T03:04:05Z');
+  const page = (sort, after, limit = 5) => dispatch(mail, 'search_messages', { from: '', sort, limit,
+    account_id: null, mailbox: null, after });
+  const ids = (result) => result.messages.map((message) => message.ref.message_id);
+  // Every message shares one received time: account a1 sorts before a2, then Mail ID breaks the tie.
+  assert.deepEqual(ids(page('newest', null)), [3, 2, 1, 7]);
+  assert.deepEqual(ids(page('newest', [stamp, 'a1', 2])), [1, 7]);
+  assert.deepEqual(ids(page('oldest', [stamp, 'a1', 2])), [3, 7]);
+  const limited = page('newest', [stamp, 'a1', 3], 1);
+  assert.deepEqual(ids(limited), [2]);
+  assert.equal(limited.has_more, true);
+  const last = page('newest', [stamp, 'a2', 7]);
+  assert.deepEqual(ids(last), []);
+  assert.equal(last.has_more, false);
+  assert.deepEqual(ids(page('newest', [stamp + 1000, 'a2', 99])), [3, 2, 1, 7]);
+  assert.deepEqual(ids(page('oldest', [stamp - 1000, '__local__', 1])), [1, 2, 3, 7]);
+  for (const after of [[stamp, '', 1], [stamp, 'a1'], [String(stamp), 'a1', 1], [stamp, 'a1', 0], { 0: stamp }]) {
+    assert.throws(() => page('newest', after), /Invalid global search/);
+  }
+});
+
 test('search refs prefer the INBOX label over the All Mail copy of the same message', () => {
   const { mail, account, inbox, archive, messages } = fixture();
   archive.name = 'All Mail';
