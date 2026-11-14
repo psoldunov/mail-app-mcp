@@ -6,7 +6,17 @@ Live use requires macOS, Apple Mail with accounts already configured, and a loca
 
 The first Mail request may prompt for Automation permission. macOS attributes that permission to the responsible application, which can differ between a terminal and an MCP client. Grant access only to the launcher you intend to use. A successful terminal test does not establish permission for a different client.
 
-Check System Settings > Privacy & Security > Automation if a request is denied. Enable Mail access under the application that actually launches the server, then restart that client's server process. The module cannot grant this permission. This implementation does not require access to Mail's private database and does not ask you to grant Full Disk Access.
+Check System Settings > Privacy & Security > Automation if a request is denied. Enable Mail access under the application that actually launches the server, then restart that client's server process. The module cannot grant this permission.
+
+### Full Disk Access for fast search
+
+`search_messages` is much faster when the server can read Mail's message index. On a store of 17,200 messages it answered in under a second, where a scan through Mail took between 3 and 29 seconds. macOS protects that file, so the application that launches the server needs Full Disk Access. This is optional: without it every tool still works, and searches scan through Mail.
+
+1. Open System Settings > Privacy & Security > Full Disk Access.
+2. Turn on the application that launches the server, or add it with the + button. As with Automation, this is the responsible application, such as the MCP client or a terminal.
+3. Run a search and check that the result reports `"backend": "index"`. If it still reports `"backend": "scan"`, read `index_unavailable` in the result, then restart the client and try again.
+
+Full Disk Access also covers data that has nothing to do with mail. The launcher and everything it starts can read it, so grant this only to a launcher you trust that far. The [safety model](safety.md#access-boundary) describes what the server reads.
 
 ## Home Manager
 
@@ -139,6 +149,7 @@ Use actual absolute paths; do not rely on shell expansion of `~`. Starting the e
 | Automation permission denied | Check the responsible launcher under macOS Automation settings. Inspect Mail before repeating any attempted write. |
 | `programs.mcp` option is missing | Use a Home Manager revision that provides it, such as the pinned revision in the README. |
 | Server is missing in the client | Check that the client consumes Home Manager's configuration or copy the generated command/args into its own settings. |
+| Search is slow and reports `"backend": "scan"` | Read `index_unavailable` in the result. Usually the launcher lacks [Full Disk Access](#full-disk-access-for-fast-search). Index search covers IMAP accounts and On My Mac; if Mail also has an Exchange or POP account, pass the `account_id` of a covered account to search it through the index. |
 | Destination is not allowed | Check the account's explicit `allowed_destinations`, including an old `[]`. Add the exact path or use `null` to permit ordinary same-account destinations, then restart. An explicit Trash override is also allowed. Sending, Drafts, and Sent guards still apply. |
 | Trash discovery is missing or ambiguous | Confirm the account's actual Trash in Mail and configure its exact path as `trash_mailbox`, then restart. The server does not guess a folder name. |
 | Missing, stale, or ambiguous reference | List the source mailbox again and use the newly returned `ref`. Draft autosave can change both IDs; moves and external changes can also invalidate references. |

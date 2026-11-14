@@ -480,8 +480,10 @@ def test_global_search_schema_and_scope(tmp_path):
     mail = FixtureMail()
     server = create_server(bridge=mail, state_dir=tmp_path)
     result = call(server, "search_messages", {"from": "isabel", "sort": "newest", "limit": 1})
+    # No Mail data folder was given, so Mail's index stays closed and Mail scans as before.
     assert result == {"operation": "search_messages", "from": "isabel", "sort": "newest",
-                      "limit": 1, "account_id": None, "mailbox": None}
+                      "limit": 1, "account_id": None, "mailbox": None,
+                      "backend": "scan", "index_unavailable": "index search is switched off"}
     tool = next(tool for tool in asyncio.run(server.list_tools()) if tool.name == "search_messages")
     assert "from" in tool.inputSchema["properties"]
     assert tool.annotations.readOnlyHint

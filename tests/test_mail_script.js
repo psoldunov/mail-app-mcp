@@ -22,6 +22,7 @@ function collection(items) {
   // A function's own `name` is read-only, so define the bulk getter instead of assigning it.
   Object.defineProperty(value, 'name', { value: () => items.map((item) => item.name()) });
   value.byId = (id) => items.find((item) => item.id() === id);
+  value.byName = (name) => items.find((item) => item.name() === name);
   value.push = (item) => { items.push(item); };
   return value;
 }
@@ -1233,4 +1234,61 @@ test('global search rejects conflicting label dates and a result that changes af
     return byId(id);
   };
   assert.throws(() => dispatch(mail, 'search_messages', args), /Message changed/);
+});
+
+function indexed() {
+  const { mail, account, inbox, messages } = fixture(2);
+  const group = Object.assign(scripting({ name: '[Gmail]', account, container: account }), { messages: collection([]) });
+  const allMail = scripting({ name: 'All Mail', account, container: group });
+  // Mail resolves a message ID from any mailbox of the store, so one message list serves both.
+  allMail.messages = inbox.messages;
+  group.mailboxes = collection([allMail]);
+  account.mailboxes = collection([group, inbox]);
+  const local = scripting({ name: 'Outbox', account: null, container: null });
+  local.messages = collection([scripting({ id: 30, messageId: '<local>', dateReceived: new Date('2026-11-01T00:00:00Z') })]);
+  mail.mailboxes = collection([local]);
+  const item = (message_id, mailbox = ['Inbox'], account_id = 'a1') =>
+    ({ account_id, mailbox, message_id, timestamp: Date.parse('2026-01-02T03:04:05Z') });
+  return { mail, inbox, allMail, messages, item };
+}
+
+test('Mail confirms messages its index nominated and supplies their header IDs', () => {
+  const { mail, inbox, allMail, messages, item } = indexed();
+  // Only the header ID, and the first message's date, may be read: no subject, sender or body.
+  inbox.messages = collection(messages.map((message, index) => new Proxy(message, { get(target, key) {
+    if (['id', 'messageId'].indexOf(key) === -1 && !(index === 1 && key === 'dateReceived')) assert.fail(`${key} was read`);
+    return target[key];
+  } })));
+  allMail.messages = inbox.messages;
+  messages[1].dateReceived = new Date('2020-01-01T00:00:00Z');
+  assert.deepEqual(dispatch(mail, 'confirm_messages', { messages: [
+    { ...item(2, ['[Gmail]', 'All Mail']), timestamp: Date.parse('2020-01-01T00:00:00Z') },
+    item(1), item(30, ['Outbox'], '__local__'),
+  ] }), { header_message_ids: ['<2@example.com>', '<1@example.com>', '<local>'] });
+});
+
+test('a nominated message Mail does not hold, or dates differently, is left unconfirmed', () => {
+  const { mail, inbox, messages, item } = indexed();
+  const gone = (number) => () => { throw Object.assign(new Error("Can't get object."), { errorNumber: number }); };
+  const known = inbox.messages.byId;
+  inbox.messages.byId = (id) => known(id) || { messageId: gone(-1728), dateReceived: gone(-1728) };
+  assert.deepEqual(dispatch(mail, 'confirm_messages', { messages: [item(1), item(99), item(2)] }),
+    { header_message_ids: ['<1@example.com>', null, '<2@example.com>'] });
+  assert.deepEqual(dispatch(mail, 'confirm_messages', { messages: [item(99), item(1)] }),
+    { header_message_ids: [null, '<1@example.com>'] });
+  // One date comparison per call exposes an index that has drifted from Mail.
+  messages[0].dateReceived = new Date('2026-01-02T03:04:06Z');
+  assert.deepEqual(dispatch(mail, 'confirm_messages', { messages: [item(1), item(2)] }),
+    { header_message_ids: [null, '<2@example.com>'] });
+  inbox.messages.byId = () => ({ messageId: gone(-1712), dateReceived: gone(-1712) });
+  assert.throws(() => dispatch(mail, 'confirm_messages', { messages: [item(1)] }), { errorNumber: -1712 });
+});
+
+test('confirmation rejects malformed nominations before touching Mail', () => {
+  const mail = new Proxy({}, { get() { throw new Error('Mail was touched'); } });
+  const good = { account_id: 'a1', mailbox: ['Inbox'], message_id: 1, timestamp: 0 };
+  for (const messages of [undefined, [], Array.from({ length: 101 }, () => good), [{ ...good, mailbox: [] }],
+    [{ ...good, message_id: 0 }], [{ ...good, account_id: '' }], [{ ...good, timestamp: '0' }], [null]]) {
+    assert.throws(() => dispatch(mail, 'confirm_messages', { messages }), /Invalid/);
+  }
 });

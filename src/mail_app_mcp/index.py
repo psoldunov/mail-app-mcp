@@ -1,0 +1,157 @@
+"""Sender search answered from Mail's own message index, the SQLite file Mail itself searches.
+
+The index finds and orders the matches and supplies their listing fields. Mail then confirms that it
+still holds each message about to be returned and supplies the header Message-ID that later calls
+check refs against. Whenever the two disagree, the search is rerun as a scan through Mail.
+"""
+
+import logging
+import os
+import sqlite3
+import time
+from contextlib import closing
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import quote, unquote, urlsplit
+
+MAIL_DATA = Path.home() / "Library" / "Mail"
+LOCAL = "__local__"
+# shortcut: only these mailbox URL forms were compared with Mail's scripting paths (macOS 27, Mail 16);
+# check an Exchange or POP store the same way before adding its scheme.
+SCHEMES = frozenset({"imap", "local"})
+log = logging.getLogger("mail_app_mcp")
+
+
+class IndexUnavailable(Exception):
+    """The index cannot answer this search; the scan through Mail still can."""
+
+
+def open_index(mail_data: Path | None) -> sqlite3.Connection:
+    if mail_data is None:
+        raise IndexUnavailable("index search is switched off")
+    try:
+        versions = [name for name in os.listdir(mail_data) if name[:1] == "V" and name[1:].isdigit()]
+    except OSError as exc:
+        raise IndexUnavailable(f"Mail's index is not readable ({exc.strerror}); grant Full Disk Access "
+                               "to the app that launches this server") from exc
+    if not versions:
+        raise IndexUnavailable("Mail has no message index yet")
+    path = mail_data / max(versions, key=lambda name: int(name[1:])) / "MailData" / "Envelope Index"
+    # Read-only, and never immutable: Mail keeps writing to this file through its write-ahead log.
+    return sqlite3.connect(f"file:{quote(str(path))}?mode=ro", uri=True, timeout=1)
+
+
+def sender_text(comment: str | None, address: str | None) -> str:
+    """The sender as Mail's scripting writes it: a display name holding a comma is quoted.
+
+    Mail also quotes an occasional other name, differently before and after a restart, so only those
+    quotes can differ from what the scan and read_message report.
+    """
+    if not comment:
+        return address or ""
+    name = '"' + comment.replace("\\", "\\\\").replace('"', '\\"') + '"' if "," in comment else comment
+    return f"{name} <{address}>"
+
+
+def mailboxes(connection: sqlite3.Connection) -> dict[int, tuple[str, str, tuple[str, ...]]]:
+    """Mailbox row -> (URL scheme, account ID, path), the last two as Mail's scripting reports them."""
+    def parsed(url: str) -> tuple[str, str, tuple[str, ...]]:
+        parts = urlsplit(url)
+        path = tuple(unquote(segment) for segment in parts.path[1:].split("/"))
+        covered = parts.scheme in SCHEMES and not parts.query and not parts.fragment and all(path)
+        return (parts.scheme if covered else "", LOCAL if parts.scheme == "local" else parts.netloc, path)
+    return {rowid: parsed(url) for rowid, url in connection.execute("SELECT ROWID, url FROM mailboxes")}
+
+
+def label_rank(path: tuple[str, ...]) -> int:
+    """Gmail lists one message under several labels; refs prefer INBOX, then other labels, then All Mail."""
+    name = path[-1].lower()
+    return 0 if name == "inbox" else 2 if name == "all mail" else 1
+
+
+def nominate(connection: sqlite3.Connection, args: dict) -> dict:
+    account_id, wanted = args["account_id"], args["mailbox"]
+    boxes = {rowid: box for rowid, box in mailboxes(connection).items() if account_id in (None, box[1])}
+    target = next((rowid for rowid, box in boxes.items() if wanted is not None and list(box[2]) == wanted), None)
+    scoped = target is not None
+    if not boxes or (wanted is not None and not scoped):
+        # Mail decides whether the account or mailbox is missing, and words the error.
+        raise IndexUnavailable("the index does not hold the requested account or mailbox")
+    if not all(scheme for scheme, _, _ in boxes.values()):
+        raise IndexUnavailable("the search covers a mailbox whose kind index search does not handle yet")
+    # Equal dates order by account as the scan does: On My Mac first, then account ID.
+    accounts = sorted({box[1] for box in boxes.values()}, key=lambda account: (account != LOCAL, account))
+    needle = args["from"].lower()
+    connection.create_function(
+        "sender_matches", 2, lambda comment, address: needle in sender_text(comment, address).lower(),
+        deterministic=True)
+    direction = "DESC" if args["sort"] == "newest" else "ASC"
+    # shortcut: SQLite walks messages in date order, so a sender with few or no matches reads every row
+    # (about 1 s per million messages); count the matches first and start from the sender index if stores get there.
+    rows = connection.execute(
+        f"WITH scope(mailbox, account_rank) AS (VALUES {','.join('(?,?)' for _ in boxes)})"
+        " SELECT m.ROWID, m.mailbox, m.date_received, a.comment, a.address,"
+        " COALESCE(m.subject_prefix, '') || COALESCE(s.subject, ''), m.read, m.flagged"
+        " FROM messages m JOIN scope ON scope.mailbox = m.mailbox"
+        " LEFT JOIN addresses a ON a.ROWID = m.sender LEFT JOIN subjects s ON s.ROWID = m.subject"
+        " WHERE m.deleted = 0"
+        + (" AND m.sender IN (SELECT ROWID FROM addresses WHERE sender_matches(comment, address))" if needle else "")
+        + (" AND (m.mailbox = ? OR m.ROWID IN (SELECT message_id FROM labels WHERE mailbox_id = ?))" if scoped else "")
+        + f" ORDER BY m.date_received {direction}, scope.account_rank, m.ROWID {direction} LIMIT ?",
+        [value for rowid, box in boxes.items() for value in (rowid, accounts.index(box[1]))]
+        + ([target, target] if scoped else []) + [args["limit"] + 1]).fetchall()
+    chosen = rows[:args["limit"]]
+    if not all(type(row[2]) is int for row in chosen):
+        raise IndexUnavailable("the index holds a message without a received date")
+    labels = [] if scoped else connection.execute(
+        f"SELECT message_id, mailbox_id FROM labels WHERE message_id IN ({','.join('?' for _ in chosen)})",
+        [row[0] for row in chosen]).fetchall()
+
+    def listed_in(rowid: int, home: int) -> tuple[str, ...]:
+        if scoped:
+            return boxes[target][2]  # A search of one mailbox keeps the mailbox that was asked for.
+        places = [home] + [box for message, box in labels if message == rowid and box in boxes]
+        return boxes[min(places, key=lambda box: (label_rank(boxes[box][2]), box))][2]
+
+    return {"has_more": len(rows) > args["limit"], "mailboxes_searched": 1 if scoped else len(boxes), "messages": [{
+        "ref": {"account_id": boxes[home][1], "mailbox": list(listed_in(rowid, home)), "message_id": rowid},
+        "subject": subject, "sender": sender_text(comment, address),
+        "date_received": datetime.fromtimestamp(received, timezone.utc)
+        .isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+        "read": bool(read), "flagged": bool(flagged), "timestamp": received * 1000,
+    } for rowid, home, received, comment, address, subject, read, flagged in chosen]}
+
+
+def confirmed(bridge, messages: list[dict]) -> list[dict]:
+    """Mail must still hold every nominated message; its header Message-ID completes each ref."""
+    if not messages:
+        return []
+    headers = bridge.call("confirm_messages", {"messages": [
+        {**{key: item["ref"][key] for key in ("account_id", "mailbox", "message_id")}, "timestamp": item["timestamp"]}
+        for item in messages]}).get("header_message_ids")
+    if (not isinstance(headers, list) or len(headers) != len(messages)
+            or not all(isinstance(header, str) for header in headers)):
+        raise IndexUnavailable("Mail did not confirm a message the index named")
+    return [{**{key: value for key, value in item.items() if key != "timestamp"},
+             "ref": {**item["ref"], "header_message_id": header}} for item, header in zip(messages, headers)]
+
+
+def search(bridge, mail_data: Path | None, args: dict) -> dict:
+    """Answer from the index when it can be read and Mail agrees; otherwise scan through Mail as before."""
+    started = time.monotonic()
+    try:
+        try:
+            with closing(open_index(mail_data)) as connection:
+                found = nominate(connection, args)
+        except sqlite3.Error as exc:
+            raise IndexUnavailable(f"Mail's index could not be queried ({exc})") from exc
+        indexed = time.monotonic()
+        messages = confirmed(bridge, found["messages"])
+    except IndexUnavailable as exc:
+        log.info("search_messages scans through Mail: %s", exc)
+        return {**bridge.call("search_messages", args), "backend": "scan", "index_unavailable": str(exc)}
+    done = time.monotonic()
+    return {"messages": messages, "complete": True, "has_more": found["has_more"], "sort": args["sort"],
+            "mailboxes_searched": found["mailboxes_searched"], "backend": "index",
+            "timing_ms": {"index": round((indexed - started) * 1000), "confirm": round((done - indexed) * 1000),
+                          "total": round((done - started) * 1000)}}

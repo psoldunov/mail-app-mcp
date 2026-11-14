@@ -38,7 +38,7 @@ Use Python 3.11+, Node.js for the bridge tests, and Nix with flakes for packagin
 
 `flake.lock` pins the build inputs. macOS is the only supported platform, with flake packages for Apple Silicon and Intel Macs. The Home Manager module works within nix-darwin. CI runs the flake checks and compiles JXA on macOS. When working inside Ensemblr, submit installs, tests, and builds through its compute queue.
 
-Tests must not open Mail, read real accounts, or mutate live messages. Replace the external Mail boundary in tests. Keep production dispatch fixed; do not add an environment variable or configuration option that replaces it with caller-controlled scripts.
+Tests must not open Mail, read real accounts, or mutate live messages. Replace the external Mail boundary in tests. `create_server` opens Mail's real index only when it is given the Mail data folder, which `main` does; index tests build their own index file and pass that folder. Keep production dispatch fixed; do not add an environment variable or configuration option that replaces it with caller-controlled scripts.
 
 ## Code locations
 
@@ -48,6 +48,7 @@ Tests must not open Mail, read real accounts, or mutate live messages. Replace t
 | `src/mail_app_mcp/models.py` | Validated references, draft inputs, and owner move policy. |
 | `src/mail_app_mcp/bridge.py` | Fixed subprocess transport and private runtime/lock handling. |
 | `src/mail_app_mcp/mail.js` | Mail scripting object lookup and closed operation dispatch. |
+| `src/mail_app_mcp/index.py` | Read-only lookup in Mail's message index for `search_messages`, and the fallback to a scan. |
 | `src/mail_app_mcp/attachments.py` | Temporary exports and bounded attachment extraction. |
 | `src/mail_app_mcp/links.py` | Bounded HTML link extraction from MIME source, without fetching URLs. |
 | `tests/` | Python protocol/policy tests and Node fake-Mail tests. |
@@ -72,3 +73,7 @@ Do not enable production use solely because offline tests pass. In particular, s
 ## Search performance acceptance
 
 With the operator-approved disposable accounts, run `search_messages` with a known sender and `limit: 1` once cold and three times warm. Record client wall time and `timing_ms`, mailbox/candidate counts, macOS/Mail version, and backend without logging message contents. Confirm the newest result against Mail across both accounts, including messages with out-of-order mailbox positions and duplicate labels. Compare the same scope with a complete legacy search; a partial legacy page is not equivalent. The offline tests verify Mail-side filtering and bounded summary hydration, but do not establish real Apple-event latency.
+
+For index search, grant Full Disk Access to the launcher and confirm that results report `"backend": "index"`. Compare the messages, their order, `has_more`, and every ref with a scan of the same scope. A server started without Full Disk Access produces that scan.
+
+The index layout is private to Apple, so repeat this comparison after a macOS upgrade. On Mail 16 and macOS 27.0.1, with three Gmail accounts, one other IMAP account, and On My Mac, the index and Mail's scripting agreed on message IDs, mailbox membership, received dates, subjects, and read and flagged state for all 34,601 listings in 42 mailboxes. Two fields differed in form. Mail's scripting quoted a sender's display name when it contained a comma, which `sender_text` reproduces. After a restart of Mail it also quoted the dotted one-word name of one message that it had reported unquoted before, so those quotes depend on Mail's state and an index result can differ from a scan in them. For 92 redirected messages it reported the Resent-Message-ID where the index stores the Message-ID, so Mail supplies the header ID of every returned message. Exchange and POP stores have not been compared; do that before adding their URL schemes to `SCHEMES` in `index.py`.

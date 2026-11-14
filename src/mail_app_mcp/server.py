@@ -22,6 +22,7 @@ from pydantic import Field, TypeAdapter
 
 from .attachments import guessed_mime
 from .bridge import BridgeError, MailBridge, OutcomeUnknown, write_lock
+from .index import MAIL_DATA, search
 from .links import message_links
 from .models import Address, Body, Draft, Identifier, Mailbox, MessageRef, Settings
 
@@ -149,7 +150,9 @@ def completed_read(message: dict) -> dict:
     return {**merged, **message_links(message.get("source"), message.get("source_truncated", False))}
 
 
-def create_server(settings: Settings | None = None, bridge=None, state_dir: Path | None = None) -> FastMCP:
+def create_server(settings: Settings | None = None, bridge=None, state_dir: Path | None = None,
+                  mail_data: Path | None = None) -> FastMCP:
+    """mail_data is Mail's data folder; without it search_messages never opens Mail's index."""
     policy = settings or Settings()
     mail = bridge if bridge is not None else MailBridge()
     directory = state_dir or DEFAULT_STATE_DIR
@@ -202,12 +205,13 @@ def create_server(settings: Settings | None = None, bridge=None, state_dir: Path
         """Search all accounts/mailboxes by literal sender (from), sorted by received date before limit.
 
         Optional account_id/mailbox narrows scope. complete means all matching headers were considered;
-        has_more means additional results exist. A bounded search that cannot finish fails, never claims latest.
-        Unscoped searches over large stores can exceed the 35-second limit; pass account_id (and mailbox) then.
+        has_more means additional results exist. backend says how it ran: index (Mail's own index, fast) or
+        scan (read through Mail, slow; index_unavailable says why). A scan that cannot finish in 35 seconds
+        fails, never claims latest; pass account_id (and mailbox) then.
         """
         if mailbox is not None and account_id is None:
             raise ValueError("mailbox requires account_id")
-        return mail.call("search_messages", {"from": sender, "sort": sort, "limit": limit,
+        return search(mail, mail_data, {"from": sender, "sort": sort, "limit": limit,
             "account_id": account_id, "mailbox": list(mailbox) if mailbox is not None else None})
 
     @tool(READ)
@@ -304,7 +308,7 @@ def main() -> None:
         settings = Settings.model_validate_json(args.config.read_text()) if args.config else Settings()
     except (OSError, ValueError) as exc:
         parser.error(f"Cannot load mailbox policy: {exc}")
-    create_server(settings).run(transport="stdio")
+    create_server(settings, mail_data=MAIL_DATA).run(transport="stdio")
 
 
 if __name__ == "__main__":

@@ -1,10 +1,10 @@
 'use strict';
 
-var OPERATIONS = ['list_accounts', 'list_mailboxes', 'trash_destination', 'list_messages', 'search_messages', 'read_message',
-  'save_attachment', 'set_message_status', 'move_message', 'create_draft', 'reply_draft', 'show_message'];
+var OPERATIONS = ['list_accounts', 'list_mailboxes', 'trash_destination', 'list_messages', 'search_messages', 'confirm_messages',
+  'read_message', 'save_attachment', 'set_message_status', 'move_message', 'create_draft', 'reply_draft', 'show_message'];
 // Failures of these leave no uncertain mail state; showing a message only opens a window.
-var RETRY_SAFE_OPERATIONS = ['list_accounts', 'list_mailboxes', 'trash_destination', 'list_messages', 'search_messages', 'read_message',
-  'save_attachment', 'show_message'];
+var RETRY_SAFE_OPERATIONS = ['list_accounts', 'list_mailboxes', 'trash_destination', 'list_messages', 'search_messages', 'confirm_messages',
+  'read_message', 'save_attachment', 'show_message'];
 var MAX_BOXES = 1000;
 var MAX_BODY_BYTES = 20 * 1024 * 1024;
 var MAX_QUOTE_CHARS = 100000;
@@ -55,6 +55,13 @@ function validate(operation, args) {
       ['newest', 'oldest'].indexOf(args.sort) !== -1 && integer(args.limit, 1, 100) &&
       (args.account_id == null || string(args.account_id)) &&
       (args.mailbox == null || (string(args.account_id) && validPath(args.mailbox))), 'Invalid global search');
+  }
+  if (operation === 'confirm_messages') {
+    requireValue(Array.isArray(args.messages) && args.messages.length >= 1 && args.messages.length <= 100 &&
+      args.messages.every(function (item) {
+        return item && string(item.account_id) && validPath(item.mailbox) &&
+          integer(item.message_id, 1, Number.MAX_SAFE_INTEGER) && Number.isSafeInteger(item.timestamp);
+      }), 'Invalid confirmation request');
   }
   if (['read_message', 'save_attachment', 'set_message_status', 'move_message', 'reply_draft', 'show_message'].indexOf(operation) !== -1) {
     var ref = args.ref;
@@ -361,6 +368,26 @@ function searchMessages(mail, args) {
     sort: args.sort, matched_candidates: candidates.length, mailboxes_searched: boxes.length,
     timing_ms: { discovery: discovered - started, filter_and_sort: filtered - discovered,
       summaries: Date.now() - filtered, total: Date.now() - started } };
+}
+
+function confirmMessages(mail, args) {
+  // Mail's index nominated these. Mail must still hold each one, and only Mail knows the header ID its
+  // scripting reports: a redirected message answers with its Resent-Message-ID, which the index lacks.
+  return { header_message_ids: args.messages.map(function (item, index) {
+    // Direct references cost no Apple event; a whose lookup rescans the mailbox (about 1 s per 5,000 messages).
+    var root = item.account_id === '__local__' ? mail : mail.accounts.byId(item.account_id);
+    var message = item.mailbox.reduce(function (container, name) {
+      return container.mailboxes.byName(name);
+    }, root).messages.byId(item.message_id);
+    try {
+      // One date comparison per call exposes an index whose layout or clock has drifted from Mail's.
+      if (index === 0 && message.dateReceived().getTime() !== item.timestamp) return null;
+      return message.messageId();
+    } catch (error) {
+      if (error.errorNumber !== -1728) throw error;
+      return null; // Gone since the index was read, or the index names something Mail does not.
+    }
+  }) };
 }
 
 function attachmentInfo(attachment) {
@@ -675,6 +702,7 @@ function dispatch(mail, operation, args) {
   case 'trash_destination': return trashDestination(mail, args);
   case 'list_messages': return listMessages(mail, args);
   case 'search_messages': return searchMessages(mail, args);
+  case 'confirm_messages': return confirmMessages(mail, args);
   case 'read_message': return readMessage(mail, args);
   case 'save_attachment': return saveAttachment(mail, args);
   case 'set_message_status': return setStatus(mail, args);

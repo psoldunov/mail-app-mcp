@@ -18,6 +18,8 @@ All accounts visible to Mail are discoverable, including the `__local__` identit
 
 The implementation uses Python 3.11+, the official MCP Python SDK 1.x's bundled FastMCP, and a fixed JXA program invoked by `osascript`. Transport is local stdio only. Mail retains account credentials and handles synchronization. Drafts can sync over the network through Mail.
 
+Sender search across accounts answers in under a second when the server can read Mail's own message index, which needs [Full Disk Access](docs/setup.md#full-disk-access-for-fast-search) for the application that launches it. Without that permission the search reads every mailbox through Mail, which took 3 to 29 seconds on a store of 17,200 messages.
+
 ## Home Manager quickstart
 
 1. Add these inputs to your configuration flake. Replace `REVIEWED_COMMIT` with the full commit SHA you intend to install. These Nixpkgs and Home Manager revisions match this project's lock file; keep your own existing pins if they provide `programs.mcp` and compatible Python dependencies.
