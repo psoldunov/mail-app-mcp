@@ -18,7 +18,7 @@ Drafts require a sender advertised by the selected account and reject an address
 
 Status changes are checked through fresh message lookups until the requested values remain stable across consecutive polls. Failure to settle is an uncertain write; do not assume the change was canceled.
 
-A per-user file lock serializes this server's writes and `show_message` across processes. Mail's UI, rules, synchronization, and other automation do not honor that lock. Uncertain write outcomes leave a persistent marker, recording what was attempted, that blocks subsequent writes until the owner inspects Mail and runs `mail-app-mcp --clear-uncertain`. See [recovery](setup.md#recover-after-an-uncertain-write). There is no automatic retry or rollback.
+A per-user file lock serializes this server's writes and `show_message` across processes. Mail's UI, rules, synchronization, and other automation do not honor that lock. Uncertain write outcomes leave a persistent marker recording what was attempted. It blocks subsequent writes only in that MCP server instance. Other instances and restarted servers start unblocked; a new chat may reuse an existing instance. Markers remain available for inspection after a session ends. The owner can clear one marker after checking Mail, or use `mail-app-mcp --clear-uncertain` to clear all recorded sessions after checking their operations. Mail can finish a timed-out operation after the server exits, so switching sessions does not make repeating it safe. See [recovery](setup.md#recover-after-an-uncertain-write). There is no automatic retry or rollback.
 
 Trash is a move, with no permanent-delete or empty-Trash operation. Provider retention, Mail settings, or another application can purge it later. Do not use Trash as a backup.
 
