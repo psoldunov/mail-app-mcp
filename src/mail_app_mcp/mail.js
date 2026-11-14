@@ -56,7 +56,11 @@ function validate(operation, args) {
       (args.account_id == null || string(args.account_id)) &&
       (args.mailbox == null || (string(args.account_id) && validPath(args.mailbox))) &&
       (args.after == null || (Array.isArray(args.after) && args.after.length === 3 && Number.isSafeInteger(args.after[0]) &&
-        string(args.after[1]) && integer(args.after[2], 1, Number.MAX_SAFE_INTEGER))), 'Invalid global search');
+        string(args.after[1]) && integer(args.after[2], 1, Number.MAX_SAFE_INTEGER))) &&
+      (args.received_after == null || Number.isSafeInteger(args.received_after)) &&
+      (args.received_before == null || Number.isSafeInteger(args.received_before)) &&
+      (args.received_after == null || args.received_before == null || args.received_after < args.received_before),
+    'Invalid global search');
   }
   if (operation === 'confirm_messages') {
     requireValue(Array.isArray(args.messages) && args.messages.length >= 1 && args.messages.length <= 100 &&
@@ -301,9 +305,10 @@ function searchDeadline(deadline) {
   requireValue(Date.now() < deadline, 'Search time limit exceeded; latest match not established. Narrow account_id or mailbox and retry');
 }
 
-function searchCandidates(scope, sender, remaining) {
+function searchCandidates(scope, args, remaining) {
   // Whole-mailbox reads filtered here; Mail's whose clause rescans the mailbox for every property read.
   // Subjects and bodies of nonmatches are never fetched.
+  var sender = args.from;
   var messages = scope.box.messages;
   var ids = bulkIds(messages);
   if (!ids.length) return [];
@@ -315,14 +320,19 @@ function searchCandidates(scope, sender, remaining) {
   var needle = sender.toLowerCase();
   var matches = ids.map(function (id, index) { return index; }).filter(function (index) {
     return !sender || (typeof senders[index] === 'string' && senders[index].toLowerCase().indexOf(needle) !== -1);
-  });
-  requireValue(matches.length <= remaining, 'Search exceeds 20000 matching headers; narrow account_id, mailbox or from');
-  return matches.map(function (index) {
+  }).map(function (index) {
     var date = dates[index];
     requireValue(integer(ids[index], 1, Number.MAX_SAFE_INTEGER) && date && typeof date.getTime === 'function' &&
       Number.isFinite(date.getTime()), 'Invalid message ID or received date; latest match not established');
     return { scope: scope, id: ids[index], timestamp: date.getTime() };
+  }).filter(function (candidate) {
+    // after is inclusive and before exclusive, as in the index search.
+    return (args.received_after == null || candidate.timestamp >= args.received_after) &&
+      (args.received_before == null || candidate.timestamp < args.received_before);
   });
+  requireValue(matches.length <= remaining,
+    'Search exceeds 20000 matching headers; narrow account_id, mailbox, from, after or before');
+  return matches;
 }
 
 function searchMessages(mail, args) {
@@ -333,7 +343,7 @@ function searchMessages(mail, args) {
   var discovered = Date.now();
   var candidates = boxes.reduce(function (result, scope) {
     searchDeadline(deadline);
-    return result.concat(searchCandidates(scope, args.from, MAX_SEARCH_MATCHES - result.length));
+    return result.concat(searchCandidates(scope, args, MAX_SEARCH_MATCHES - result.length));
   }, []);
   var unique = candidates.slice().sort(function (a, b) {
     return a.scope.account_id.localeCompare(b.scope.account_id) || a.id - b.id || a.scope.rank - b.scope.rank;
