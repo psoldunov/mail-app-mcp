@@ -11,10 +11,11 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sqlite3
 import time
 from contextlib import closing
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote, unquote, urlsplit
 
@@ -23,6 +24,7 @@ LOCAL = "__local__"
 # shortcut: only these mailbox URL forms were compared with Mail's scripting paths (macOS 27, Mail 16);
 # check an Exchange or POP store the same way before adding its scheme.
 SCHEMES = frozenset({"imap", "local"})
+EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 log = logging.getLogger("mail_app_mcp")
 
 
@@ -78,9 +80,47 @@ def account_order(account: str) -> tuple[bool, str]:
     return account != LOCAL, account
 
 
+def utc_text(stamp: int) -> str:
+    """Milliseconds since the epoch as the UTC ISO text results use for date_received."""
+    return (EPOCH + timedelta(milliseconds=stamp)).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def received_range(after: str | None, before: str | None) -> tuple[int | None, int | None]:
+    """after (inclusive) and before (exclusive) in ms since the epoch. A value without an offset is local time."""
+    def stamp(name: str, text: str | None) -> int | None:
+        if text is None:
+            return None
+        try:
+            moment = datetime.fromisoformat(text)
+            micros = ((moment if moment.tzinfo else moment.astimezone()) - EPOCH) // timedelta(microseconds=1)
+            # fromisoformat drops digits past the microsecond; a nonzero one puts the instant just after micros.
+            finer = re.search(r"[.,]\d{6}(\d+)", text)
+            micros += bool(finer and finer.group(1).strip("0"))
+            # Received dates are whole milliseconds, so rounding a finer bound up keeps both ends exact.
+            result = -(-micros // 1000)
+            utc_text(result)
+        except (ValueError, OverflowError, OSError):
+            raise ValueError(f"{name} must be an ISO 8601 date or date and time, such as 2026-03-01, "
+                             f"2026-03-01T09:30 or 2026-03-01T09:30:00Z; got {text!r}") from None
+        return result
+    low, high = stamp("after", after), stamp("before", before)
+    if low is not None and high is not None and low >= high:
+        raise ValueError("after must be earlier than before: after is inclusive and before exclusive, "
+                         "so March is after=2026-03-01, before=2026-04-01")
+    return low, high
+
+
+def received_clause(args: dict) -> tuple[str, list]:
+    """Whole-second bounds on date_received, so SQLite seeks its date index to the range."""
+    bounds = [(">=", args["received_after"]), ("<", args["received_before"])]
+    # date_received counts whole seconds: d * 1000 >= ms iff d >= ceil(ms / 1000), and the same for <.
+    return ("".join(f" AND m.date_received {operator} ?" for operator, stamp in bounds if stamp is not None),
+            [-(-stamp // 1000) for _, stamp in bounds if stamp is not None])
+
+
 def query_digest(args: dict) -> str:
-    """A cursor continues only the search it came from: the same sender text, scope and sort."""
-    fields = [args[key] for key in ("from", "account_id", "mailbox", "sort")]
+    """A cursor continues only the search it came from: the same sender text, scope, sort and date range."""
+    fields = [args[key] for key in ("from", "account_id", "mailbox", "sort", "received_after", "received_before")]
     return hashlib.sha256(json.dumps(fields).encode()).hexdigest()[:16]
 
 
@@ -99,8 +139,8 @@ def resume_point(args: dict, cursor: str | None) -> list | None:
     if not valid:
         raise ValueError("cursor is not one search_messages returned; start again without cursor")
     if data["q"] != query_digest(args):
-        raise ValueError("cursor belongs to a different search; repeat its from, account_id, mailbox and sort, "
-                         "or start again without cursor")
+        raise ValueError("cursor belongs to a different search; repeat its from, account_id, mailbox, sort, "
+                         "after and before, or start again without cursor")
     return [stamp, account, message_id]
 
 
@@ -149,8 +189,12 @@ def nominate(connection: sqlite3.Connection, args: dict) -> dict:
         deterministic=True)
     direction = "DESC" if args["sort"] == "newest" else "ASC"
     after, after_values = after_clause(args["after"], args["sort"] == "newest", accounts)
+    received, received_values = received_clause(args)
     # shortcut: SQLite walks messages in date order, so a sender with few or no matches reads every row
-    # (about 1 s per million messages); count the matches first and start from the sender index if stores get there.
+    # (about 1 s per million messages), or every row in the range when after or before bounds the search;
+    # count the matches first and start from the sender index if stores get there.
+    # shortcut: like a cursor bound (see after_clause), a range leaves out a row with a NULL date instead of sending
+    # the search to the scan.
     rows = connection.execute(
         f"WITH scope(mailbox, account_rank) AS (VALUES {','.join('(?,?)' for _ in boxes)})"
         " SELECT m.ROWID, m.mailbox, m.date_received, a.comment, a.address,"
@@ -160,10 +204,10 @@ def nominate(connection: sqlite3.Connection, args: dict) -> dict:
         " WHERE m.deleted = 0"
         + (" AND m.sender IN (SELECT ROWID FROM addresses WHERE sender_matches(comment, address))" if needle else "")
         + (" AND (m.mailbox = ? OR m.ROWID IN (SELECT message_id FROM labels WHERE mailbox_id = ?))" if scoped else "")
-        + after
+        + after + received
         + f" ORDER BY m.date_received {direction}, scope.account_rank, m.ROWID {direction} LIMIT ?",
         [value for rowid, box in boxes.items() for value in (rowid, accounts.index(box[1]))]
-        + ([target, target] if scoped else []) + after_values + [args["limit"] + 1]).fetchall()
+        + ([target, target] if scoped else []) + after_values + received_values + [args["limit"] + 1]).fetchall()
     chosen = rows[:args["limit"]]
     if not all(type(row[2]) is int for row in chosen):
         raise IndexUnavailable("the index holds a message without a received date")
@@ -206,6 +250,9 @@ def search(bridge, mail_data: Path | None, args: dict, cursor: str | None = None
     Both continue after the cursor's message by the same order, so either can serve any page.
     """
     args = {**args, "after": resume_point(args, cursor)}
+    # The range as it was read, so a caller sees which instants a local date meant.
+    echo = {name: None if args[key] is None else utc_text(args[key])
+            for name, key in (("after", "received_after"), ("before", "received_before"))}
     started = time.monotonic()
     try:
         try:
@@ -218,10 +265,11 @@ def search(bridge, mail_data: Path | None, args: dict, cursor: str | None = None
     except IndexUnavailable as exc:
         log.info("search_messages scans through Mail: %s", exc)
         scanned = bridge.call("search_messages", args)
-        return {**scanned, "next_cursor": next_cursor(args, scanned), "backend": "scan", "index_unavailable": str(exc)}
+        return {**scanned, **echo, "next_cursor": next_cursor(args, scanned), "backend": "scan",
+                "index_unavailable": str(exc)}
     done = time.monotonic()
     page = {"messages": messages, "has_more": found["has_more"]}
-    return {**page, "next_cursor": next_cursor(args, page), "complete": True, "sort": args["sort"],
+    return {**page, **echo, "next_cursor": next_cursor(args, page), "complete": True, "sort": args["sort"],
             "mailboxes_searched": found["mailboxes_searched"], "backend": "index",
             "timing_ms": {"index": round((indexed - started) * 1000), "confirm": round((done - indexed) * 1000),
                           "total": round((done - started) * 1000)}}

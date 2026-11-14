@@ -22,7 +22,7 @@ from pydantic import Field, TypeAdapter
 
 from .attachments import guessed_mime
 from .bridge import BridgeError, MailBridge, OutcomeUnknown, write_lock
-from .index import MAIL_DATA, search
+from .index import MAIL_DATA, received_range, search
 from .links import message_links
 from .models import Address, Body, Draft, Identifier, Mailbox, MessageRef, Settings
 
@@ -202,12 +202,18 @@ def create_server(settings: Settings | None = None, bridge=None, state_dir: Path
     def search_messages(sender: Annotated[str, Field(validation_alias="from", max_length=1000)] = "",
                         sort: Literal["newest", "oldest"] = "newest", limit: Limit = 50,
                         account_id: Identifier | None = None, mailbox: Mailbox | None = None,
-                        cursor: Annotated[str, Field(max_length=1000)] | None = None) -> dict:
+                        cursor: Annotated[str, Field(max_length=1000)] | None = None,
+                        after: Annotated[str, Field(max_length=100)] | None = None,
+                        before: Annotated[str, Field(max_length=100)] | None = None) -> dict:
         """Search all accounts/mailboxes by literal sender (from), sorted by received date before limit.
 
-        Optional account_id/mailbox narrows scope. complete means all matching headers were considered;
-        has_more means additional results exist. For the next page pass next_cursor as cursor with the same
-        from, account_id, mailbox and sort (limit may change). A page continues after the last message returned,
+        Optional account_id/mailbox narrows scope. Optional after (inclusive) and before (exclusive) bound the
+        received date, each ISO 8601; either alone works, and from may be empty. A date alone is local midnight
+        on this Mac, a time without an offset is local, and Z or an offset is honored. Mail from March:
+        after=2026-03-01, before=2026-04-01. The response echoes the range in UTC as after and before.
+        complete means all matching headers were considered; has_more means additional results exist.
+        For the next page pass next_cursor as cursor with the same from, account_id, mailbox, sort, after and
+        before (limit may change). A page continues after the last message returned,
         so mail arriving between pages causes no repeats or gaps; mail newer than that message appears only in
         a fresh newest search. A cursor from another search is rejected.
         backend says how it ran: index (Mail's own index, fast) or scan (read through Mail, slow;
@@ -216,8 +222,10 @@ def create_server(settings: Settings | None = None, bridge=None, state_dir: Path
         """
         if mailbox is not None and account_id is None:
             raise ValueError("mailbox requires account_id")
+        received_after, received_before = received_range(after, before)
         return search(mail, mail_data, {"from": sender, "sort": sort, "limit": limit,
-            "account_id": account_id, "mailbox": list(mailbox) if mailbox is not None else None}, cursor)
+            "account_id": account_id, "mailbox": list(mailbox) if mailbox is not None else None,
+            "received_after": received_after, "received_before": received_before}, cursor)
 
     @tool(READ)
     def read_message(ref: MessageRef, max_chars: TextLimit = 50_000) -> dict:

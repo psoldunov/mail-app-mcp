@@ -3,6 +3,7 @@
 import base64
 import json
 import sqlite3
+import time
 from datetime import datetime
 
 import pytest
@@ -105,7 +106,7 @@ def test_newest_sender_match_across_accounts_comes_from_the_index(tmp_path):
 
 ISABEL = (10, 4, "Isabel Ortiz", "isabel@example.org", "Hello", "2026-11-01T10:00:00+00:00", 0, 0, 0)
 SCAN_REQUEST = ("search_messages", {"from": "isabel", "sort": "newest", "limit": 1, "account_id": None, "mailbox": None,
-                                    "after": None})
+                                    "received_after": None, "received_before": None, "after": None})
 
 
 def test_without_a_usable_index_mail_scans_as_before_and_says_why(tmp_path):
@@ -308,6 +309,120 @@ def test_the_scan_continues_from_an_index_cursor_and_hands_back_one_the_index_co
     second = call(scanned, "search_messages", {"limit": 1, "cursor": first["next_cursor"]})
     stamp = int(datetime.fromisoformat(SAME).timestamp()) * 1000
     assert mail.requests == [("search_messages", {"from": "", "sort": "newest", "limit": 1, "account_id": None,
-                                                  "mailbox": None, "after": [stamp, "__local__", 33]})]
+                                                  "mailbox": None, "received_after": None, "received_before": None,
+                                                  "after": [stamp, "__local__", 33]})]
     assert second["backend"] == "scan" and ids(second) == [32]
     assert ids(call(indexed, "search_messages", {"limit": 5, "cursor": second["next_cursor"]})) == [31, 39]
+
+
+@pytest.fixture
+def berlin(monkeypatch):
+    """The Mac's time zone, fixed to Central European time in POSIX form so no time zone database is needed."""
+    monkeypatch.setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3")
+    time.tzset()
+    yield
+    monkeypatch.undo()
+    time.tzset()
+
+
+def utc_ms(text):
+    return int(datetime.fromisoformat(text).timestamp()) * 1000
+
+
+# The last and first second on each side of March 2026, in UTC.
+EDGES = [stored(60, 1, "2026-02-28T23:59:59+00:00"), stored(61, 4, "2026-03-01T00:00:00+00:00"),
+         stored(62, 1, "2026-03-15T12:00:00+00:00"), stored(63, 4, "2026-03-31T23:59:59+00:00"),
+         stored(64, 1, "2026-04-01T00:00:00+00:00")]
+MARCH = {"after": "2026-03-01T00:00:00Z", "before": "2026-04-01T00:00:00Z"}
+
+
+def test_after_includes_its_own_instant_and_before_leaves_its_own_out(tmp_path):
+    server = create_server(bridge=FakeMail(), state_dir=tmp_path / "state", mail_data=make_index(tmp_path / "Mail", EDGES))
+    march = call(server, "search_messages", MARCH)
+    assert ids(march) == [63, 62, 61] and march["backend"] == "index"
+    assert (march["after"], march["before"]) == ("2026-03-01T00:00:00.000Z", "2026-04-01T00:00:00.000Z")
+    assert ids(call(server, "search_messages", {"after": "2026-03-31T23:59:59Z"})) == [64, 63]
+    assert ids(call(server, "search_messages", {"before": "2026-03-01T00:00:00Z"})) == [60]
+    # A bound finer than Mail's whole seconds is exact too: 23:59:59.5 comes after a message received at 23:59:59.
+    finer = call(server, "search_messages", {"after": "2026-03-31T23:59:59.5Z", "before": "2026-04-01T00:00:00.001Z"})
+    assert ids(finer) == [64] and finer["after"] == "2026-03-31T23:59:59.500Z"
+    # Digits past the microsecond, which Python's parser drops, still count; zeros there change nothing.
+    tenth = call(server, "search_messages", {"after": "2026-03-01T00:00:00.0000001Z",
+                                             "before": "2026-03-31T23:59:59.0000001Z"})
+    assert ids(tenth) == [63, 62]
+    assert (tenth["after"], tenth["before"]) == ("2026-03-01T00:00:00.001Z", "2026-03-31T23:59:59.001Z")
+    zeros = {"after": "2026-03-01T00:00:00,0000000Z", "before": "2026-03-02T00:00:00Z"}
+    assert ids(call(server, "search_messages", zeros)) == [61]
+    unbounded = call(server, "search_messages", {})
+    assert len(ids(unbounded)) == 5 and (unbounded["after"], unbounded["before"]) == (None, None)
+
+
+def test_a_date_alone_is_local_midnight_and_an_offset_is_honored(tmp_path, berlin):
+    # Berlin is UTC+1 on 1 March and UTC+2 on 1 April, so its March runs from 23:00 to 22:00 UTC.
+    index = make_index(tmp_path / "Mail", [
+        stored(70, 1, "2026-02-28T22:59:59+00:00"), stored(71, 1, "2026-02-28T23:00:00+00:00"),
+        stored(72, 1, "2026-03-31T21:59:59+00:00"), stored(73, 1, "2026-03-31T22:00:00+00:00")])
+    server = create_server(bridge=FakeMail(), state_dir=tmp_path / "state", mail_data=index)
+    march = call(server, "search_messages", {"after": "2026-03-01", "before": "2026-04-01"})
+    assert ids(march) == [72, 71]
+    assert (march["after"], march["before"]) == ("2026-02-28T23:00:00.000Z", "2026-03-31T22:00:00.000Z")
+    for written, read in (("2026-03-01T00:00", "2026-02-28T23:00:00.000Z"), ("2026-03-01 00:00:00", "2026-02-28T23:00:00.000Z"),
+                          ("2026-03-01T00:00:00Z", "2026-03-01T00:00:00.000Z"),
+                          ("2026-03-01T00:00:00+05:00", "2026-02-28T19:00:00.000Z")):
+        assert call(server, "search_messages", {"after": written})["after"] == read, written
+    # A local time a clock change skips or repeats is read with the offset in force before the change.
+    for written, read in (("2026-03-29T02:30", "2026-03-29T01:30:00.000Z"), ("2026-10-25T02:30", "2026-10-25T00:30:00.000Z")):
+        assert call(server, "search_messages", {"after": written})["after"] == read, written
+
+
+def test_an_unreadable_date_or_an_empty_range_is_rejected_before_asking_mail(tmp_path):
+    mail = FakeMail()
+    server = create_server(bridge=mail, state_dir=tmp_path / "state", mail_data=make_index(tmp_path / "Mail", EDGES))
+    for bad in ("", "yesterday", "2026-03", "2026-13-01", "2026-02-30", "03/01/2026", "2026-03-01T25:00",
+                "2026-03-01T00:00+24:00", "9999-12-31T23:59:59-01:00"):
+        for name in ("after", "before"):
+            with pytest.raises(Exception, match=f"{name} must be an ISO 8601 date"):
+                call(server, "search_messages", {name: bad})
+    for after, before in (("2026-04-01T00:00:00Z", "2026-03-01T00:00:00Z"), ("2026-03-01", "2026-03-01"),
+                          ("2026-03-01T01:00:00+01:00", "2026-03-01T00:00:00Z")):
+        with pytest.raises(Exception, match="after must be earlier than before"):
+            call(server, "search_messages", {"after": after, "before": before})
+    assert mail.requests == []
+
+
+def test_pages_inside_a_range_stay_in_it_and_follow_the_cursor(tmp_path):
+    inside = [stored(80 + day, 1 if day % 2 else 4, f"2026-03-{day:02d}T12:00:00+00:00") for day in range(1, 8)]
+    outside = [stored(90, 1, "2026-02-27T12:00:00+00:00"), stored(91, 4, "2026-03-08T00:00:00+00:00")]
+    index = make_index(tmp_path / "Mail", inside + outside)
+    server = create_server(bridge=FakeMail(), state_dir=tmp_path / "state", mail_data=index)
+    week = {"after": "2026-03-01T00:00:00Z", "before": "2026-03-08T00:00:00Z", "limit": 3}
+    assert pages(server, week) == [[87, 86, 85], [84, 83, 82], [81]]
+    assert pages(server, {**week, "sort": "oldest"}) == [[81, 82, 83], [84, 85, 86], [87]]
+
+
+def test_a_cursor_only_continues_under_the_range_it_came_from(tmp_path):
+    mail = FakeMail()
+    server = create_server(bridge=mail, state_dir=tmp_path / "state", mail_data=make_index(tmp_path / "Mail", EDGES))
+    cursor = call(server, "search_messages", {**MARCH, "limit": 1})["next_cursor"]
+    unbounded = call(server, "search_messages", {"limit": 1})["next_cursor"]
+    asked = len(mail.requests)
+    for changed in ({"after": None}, {"before": None}, {"after": "2026-03-01T00:00:01Z"},
+                    {"before": "2026-05-01T00:00:00Z"}, {"cursor": unbounded}):
+        with pytest.raises(Exception, match="different search"):
+            call(server, "search_messages", {**MARCH, "cursor": cursor, **changed})
+    assert len(mail.requests) == asked
+    # The same instants written another way are the same range.
+    same = {"after": "2026-03-01T01:00:00+01:00", "before": "2026-04-01T00:00:00Z", "cursor": cursor}
+    assert ids(call(server, "search_messages", same)) == [62, 61]
+
+
+def test_the_scan_gets_the_same_range_and_the_response_echoes_it(tmp_path):
+    mail = FakeMail()
+    server = create_server(bridge=mail, state_dir=tmp_path / "state", mail_data=None)
+    result = call(server, "search_messages", {"after": "2026-03-01T00:00:00Z", "before": "2026-04-01T00:00:00.0005Z"})
+    assert mail.requests == [("search_messages", {
+        "from": "", "sort": "newest", "limit": 50, "account_id": None, "mailbox": None,
+        "received_after": utc_ms("2026-03-01T00:00:00+00:00"),
+        "received_before": utc_ms("2026-04-01T00:00:00+00:00") + 1, "after": None})]
+    assert result["backend"] == "scan"
+    assert (result["after"], result["before"]) == ("2026-03-01T00:00:00.000Z", "2026-04-01T00:00:00.001Z")

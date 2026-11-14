@@ -1213,6 +1213,39 @@ test('a scan continues after the previous page by the order it sorts in, never f
   }
 });
 
+test('a scan keeps only mail received in the range, after inclusive and before exclusive', () => {
+  const { mail, inbox, messages } = fixture(4);
+  // The last and first second on each side of March 2026.
+  const times = ['2026-02-28T23:59:59Z', '2026-03-01T00:00:00Z', '2026-03-31T23:59:59Z', '2026-04-01T00:00:00Z'];
+  times.forEach((time, index) => { messages[index].dateReceived = new Date(time); });
+  const after = Date.parse(times[1]);
+  const before = Date.parse(times[3]);
+  const args = { from: '', sort: 'newest', limit: 5, account_id: 'a1', mailbox: null };
+  const search = (range) => dispatch(mail, 'search_messages', { ...args, ...range });
+  const ids = (result) => result.messages.map((message) => message.ref.message_id);
+  const march = search({ received_after: after, received_before: before });
+  assert.deepEqual(ids(march), [3, 2]);
+  assert.equal(march.matched_candidates, 2);
+  assert.deepEqual(ids(search({ received_after: after, received_before: null })), [4, 3, 2]);
+  assert.deepEqual(ids(search({ received_before: before })), [3, 2, 1]);
+  // Pages inside the range stay in it.
+  const first = search({ received_after: after, received_before: before, limit: 1 });
+  assert.deepEqual(ids(first), [3]);
+  assert.equal(first.has_more, true);
+  const second = search({ received_after: after, received_before: before, after: [Date.parse(times[2]), 'a1', 3] });
+  assert.deepEqual(ids(second), [2]);
+  assert.equal(second.has_more, false);
+  // The range narrows a sender with too many headers below the cap before the cap applies.
+  const many = Array.from({ length: 20001 }, (_, index) => index + 1);
+  inbox.messages = { id: () => many, dateReceived: () => many.map(() => new Date('2026-01-01T00:00:00Z')) };
+  assert.throws(() => search({}), /20000/);
+  assert.deepEqual(ids(search({ received_after: after })), []);
+  for (const bad of [{ received_after: before, received_before: after }, { received_after: after, received_before: after },
+    { received_after: '2026-03-01' }, { received_before: 1.5 }, { received_after: Number.MAX_SAFE_INTEGER + 1 }]) {
+    assert.throws(() => dispatch({}, 'search_messages', { ...args, ...bad }), /Invalid global search/);
+  }
+});
+
 test('search refs prefer the INBOX label over the All Mail copy of the same message', () => {
   const { mail, account, inbox, archive, messages } = fixture();
   archive.name = 'All Mail';
