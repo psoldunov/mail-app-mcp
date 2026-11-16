@@ -51,7 +51,7 @@ def test_multiaccount_discovery_and_no_forbidden_tools(tmp_path):
     accounts = call(server, "list_accounts", {})["accounts"]
     assert [a["account_id"] for a in accounts] == ["work", "personal"]
     names = {tool.name for tool in asyncio.run(server.list_tools())}
-    assert {"create_draft", "trash_message", "trash_messages", "read_attachment"} <= names
+    assert {"create_draft", "trash_message", "trash_messages", "move_messages", "set_messages_status", "read_attachment"} <= names
     assert not names & {"send", "send_email", "delete", "delete_message", "run_script", "empty_trash"}
 
 
@@ -145,7 +145,7 @@ def test_trash_messages_stops_at_an_uncertain_move_and_later_batches_stay_blocke
 
 
 def test_trash_messages_starts_no_move_after_the_time_budget_but_always_tries_one(tmp_path, monkeypatch):
-    monkeypatch.setattr("mail_app_mcp.server.TRASH_BUDGET_SECONDS", 0)
+    monkeypatch.setattr("mail_app_mcp.server.BATCH_BUDGET_SECONDS", 0)
     mail = FixtureMail()
     server = create_server(bridge=mail, state_dir=tmp_path)
     refs = [REF, {**REF, "message_id": 8}, {**REF, "message_id": 9}]
@@ -166,11 +166,80 @@ def test_trash_messages_rejects_the_batch_before_any_move_when_a_trash_is_not_al
 
 
 @pytest.mark.parametrize("count", [0, 101])
-def test_trash_messages_takes_one_to_a_hundred_refs(tmp_path, count):
+@pytest.mark.parametrize("name, extra", [
+    ("trash_messages", {}), ("move_messages", {"destination": ["Archive"]}), ("set_messages_status", {"read": True})])
+def test_batch_tools_take_one_to_a_hundred_refs(tmp_path, count, name, extra):
     mail = FixtureMail()
     with pytest.raises(Exception):
-        call(create_server(bridge=mail, state_dir=tmp_path), "trash_messages", {"refs": [REF] * count})
+        call(create_server(bridge=mail, state_dir=tmp_path), name, {"refs": [REF] * count, **extra})
     assert not mail.requests
+
+
+def test_move_messages_moves_every_ref_and_reports_ones_already_there(tmp_path):
+    mail = FixtureMail()
+    settings = Settings.model_validate({"accounts": {"work": {"allowed_destinations": [["Archive"]]}}})
+    server = create_server(settings, mail, tmp_path)
+    refs = [REF, {**REF, "mailbox": ["Archive"], "message_id": 8}, {**REF, "message_id": 9}]
+    result = call(server, "move_messages", {"refs": refs, "destination": ["Archive"]})
+    assert result["moved"] == 2 and result["stopped"] == "end" and result["not_attempted"] == []
+    first, already, last = result["results"]
+    assert first["moved"] is True and first["destination"] == ["Archive"] and last["moved"] is True
+    assert already["moved"] is False and already["retry_safe"] is True and "already in the destination" in already["error"]
+    assert [args["ref"]["message_id"] for op, args in mail.requests if op == "move_message"] == [7, 9]
+
+
+@pytest.mark.parametrize("refs, destination, error", [
+    ([REF, {**REF, "account_id": "personal"}], ["Archive"], "one account"),
+    ([REF, {**REF, "message_id": 8}], ["Spam"], "not configured"),
+])
+def test_move_messages_rejects_the_batch_before_any_move(tmp_path, refs, destination, error):
+    mail = FixtureMail()
+    settings = Settings.model_validate({"accounts": {"work": {"allowed_destinations": [["Archive"]]}}})
+    server = create_server(settings, mail, tmp_path)
+    with pytest.raises(Exception, match=error):
+        call(server, "move_messages", {"refs": refs, "destination": destination})
+    assert not [op for op, _ in mail.requests if op == "move_message"]
+    assert not list(tmp_path.glob("write-uncertain*"))
+
+
+def test_set_messages_status_updates_refs_across_accounts_and_reports_rejections(tmp_path):
+    class StaleEight(FixtureMail):
+        def call(self, operation, args):
+            if operation == "set_message_status" and args["ref"]["message_id"] == 8:
+                self.requests.append((operation, args))
+                raise BridgeError("Message reference is stale", operation=operation)
+            return super().call(operation, args)
+    mail = StaleEight()
+    server = create_server(bridge=mail, state_dir=tmp_path)
+    refs = [REF, {**REF, "message_id": 8}, {**REF, "account_id": "personal", "message_id": 9}]
+    result = call(server, "set_messages_status", {"refs": refs, "read": True, "flagged": False})
+    assert result["updated"] == 2 and result["stopped"] == "end" and result["not_attempted"] == []
+    done, stale, other = result["results"]
+    assert done["updated"] is True and done["read"] is True and done["flagged"] is False
+    assert stale["updated"] is False and stale["retry_safe"] is True and "stale" in stale["error"]
+    assert other["updated"] is True and other["ref"]["account_id"] == "personal"
+    writes = [args for op, args in mail.requests if op == "set_message_status"]
+    assert [(args["ref"]["message_id"], args["read"], args["flagged"]) for args in writes] == [
+        (7, True, False), (8, True, False), (9, True, False)]
+    with pytest.raises(Exception, match="Provide"):
+        call(server, "set_messages_status", {"refs": refs})
+
+
+def test_set_messages_status_stops_at_an_uncertain_change(tmp_path):
+    class UncertainEight(FixtureMail):
+        def call(self, operation, args):
+            if operation == "set_message_status" and args["ref"]["message_id"] == 8:
+                self.requests.append((operation, args))
+                raise OutcomeUnknown("Mail timed out", operation=operation)
+            return super().call(operation, args)
+    mail = UncertainEight()
+    server = create_server(bridge=mail, state_dir=tmp_path)
+    refs = [REF, {**REF, "message_id": 8}, {**REF, "message_id": 9}]
+    result = call(server, "set_messages_status", {"refs": refs, "flagged": True})
+    assert result["updated"] == 1 and result["stopped"] == "uncertain_write"
+    assert result["results"][1]["retry_safe"] is False and "Inspect Mail" in result["results"][1]["error"]
+    assert [ref["message_id"] for ref in result["not_attempted"]] == [9]
+    assert [args["ref"]["message_id"] for op, args in mail.requests if op == "set_message_status"] == [7, 8]
 
 
 @pytest.mark.parametrize("discovered", [
