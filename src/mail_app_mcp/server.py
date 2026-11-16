@@ -30,6 +30,7 @@ Limit = Annotated[int, Field(strict=True, ge=1, le=100)]
 Offset = Annotated[int, Field(strict=True, ge=0, le=2**53 - 1)]
 TextLimit = Annotated[int, Field(strict=True, ge=1, le=100_000)]
 StrictBool = Annotated[bool, Field(strict=True)]
+TrashBatch = Annotated[tuple[MessageRef, ...], Field(min_length=1, max_length=100)]
 READ = ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False)
 WRITE = ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=False)
 DRAFT = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False)
@@ -37,6 +38,8 @@ SHOW = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint
 DEFAULT_STATE_DIR = Path.home() / "Library" / "Caches" / "mail-app-mcp"
 MARKER = "write-uncertain"
 MAX_MARKER_BYTES = 16_384
+# Leaves the last move time to finish inside the 60-second tool timeout common to MCP clients.
+TRASH_BUDGET_SECONDS = 30
 log = logging.getLogger("mail_app_mcp")
 
 
@@ -286,19 +289,51 @@ def create_server(settings: Settings | None = None, bridge=None, state_dir: Path
             raise ValueError("Message is already in the destination mailbox")
         return perform_write(mail, marker, "move_message", {"ref": ref.model_dump(mode="json"), "destination": target})
 
-    @tool(WRITE)
-    def trash_message(ref: MessageRef) -> dict:
-        """Move to Mail's account Trash or an owner override, subject to destination restrictions. Retention policies still apply."""
-        target = policy.trash(ref.account_id)
+    def trash_destination(account_id: str) -> list[str]:
+        target = policy.trash(account_id)
         if target is None:
-            discovered = mail.call("trash_destination", {"account_id": ref.account_id})
-            if discovered.get("account_id") != ref.account_id:
+            discovered = mail.call("trash_destination", {"account_id": account_id})
+            if discovered.get("account_id") != account_id:
                 raise ValueError("Discovered Trash belongs to another account")
             path = TypeAdapter(Mailbox).validate_python(discovered.get("destination"))
-            target = policy.destination(ref.account_id, path)
+            target = policy.destination(account_id, path)
+        return target
+
+    def move_to_trash(ref: MessageRef, target: list[str]) -> dict:
         if tuple(target) == ref.mailbox:
             raise ValueError("Message is already in Trash")
         return perform_write(mail, marker, "move_message", {"ref": ref.model_dump(mode="json"), "destination": target})
+
+    @tool(WRITE)
+    def trash_message(ref: MessageRef) -> dict:
+        """Move to Mail's account Trash or an owner override, subject to destination restrictions. Retention policies still apply."""
+        return move_to_trash(ref, trash_destination(ref.account_id))
+
+    @tool(WRITE)
+    def trash_messages(refs: TrashBatch) -> dict:
+        """Trash up to 100 messages in order, each moved and verified like trash_message. Re-list afterward.
+
+        Every account's Trash is resolved before any move. A rejected message is reported in results and the
+        rest continue. stopped says why the call ended: end, time_budget (no move starts after 30 seconds; pass
+        not_attempted again) or uncertain_write (do not retry; follow the error's recovery steps).
+        """
+        started = time.monotonic()
+        targets = {account: trash_destination(account) for account in dict.fromkeys(ref.account_id for ref in refs)}
+        results, stopped = [], "end"
+        for ref in refs:
+            if results and time.monotonic() - started >= TRASH_BUDGET_SECONDS:
+                stopped = "time_budget"
+                break
+            item = {"ref": ref.model_dump(mode="json")}
+            try:
+                results.append({**item, **move_to_trash(ref, targets[ref.account_id])})
+            except (BridgeError, ValueError) as exc:
+                results.append({**item, "moved": False, "retry_safe": getattr(exc, "retry_safe", True), "error": str(exc)})
+                if os.path.lexists(marker):  # This move's outcome is unknown, or an earlier one blocks the session.
+                    stopped = "uncertain_write"
+                    break
+        return {"moved": sum(item.get("moved") is True for item in results), "stopped": stopped, "results": results,
+                "not_attempted": [ref.model_dump(mode="json") for ref in refs[len(results):]]}
 
     return server
 
