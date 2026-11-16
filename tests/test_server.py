@@ -32,6 +32,8 @@ class FixtureMail:
         if operation == "create_draft":
             return {"status": "draft", "account_id": args["account_id"], "sender": args["sender"],
                     "ref": {**REF, "mailbox": ["Drafts"], "message_id": 12}}
+        if operation == "move_message":
+            return {"account_id": args["ref"]["account_id"], "destination": args["destination"], "moved": True}
         return {"operation": operation, **args}
 
 
@@ -49,7 +51,7 @@ def test_multiaccount_discovery_and_no_forbidden_tools(tmp_path):
     accounts = call(server, "list_accounts", {})["accounts"]
     assert [a["account_id"] for a in accounts] == ["work", "personal"]
     names = {tool.name for tool in asyncio.run(server.list_tools())}
-    assert {"create_draft", "trash_message", "read_attachment"} <= names
+    assert {"create_draft", "trash_message", "trash_messages", "read_attachment"} <= names
     assert not names & {"send", "send_email", "delete", "delete_message", "run_script", "empty_trash"}
 
 
@@ -83,6 +85,92 @@ def test_default_moves_and_discovered_trash_respect_explicit_restrictions(tmp_pa
     with pytest.raises(Exception, match="configured"):
         call(restricted, "trash_message", {"ref": REF})
     assert len([op for op, _ in mail.requests if op == "move_message"]) == writes_before
+
+
+def test_trash_messages_moves_every_ref_and_discovers_each_accounts_trash_once(tmp_path):
+    mail = FixtureMail()
+    server = create_server(bridge=mail, state_dir=tmp_path)
+    refs = [REF, {**REF, "message_id": 8}, {**REF, "account_id": "personal", "message_id": 9}]
+    result = call(server, "trash_messages", {"refs": refs})
+    assert result["moved"] == 3 and result["stopped"] == "end" and result["not_attempted"] == []
+    assert [item["ref"]["message_id"] for item in result["results"]] == [7, 8, 9]
+    assert all(item["moved"] is True and item["destination"] == ["Deleted Items"] for item in result["results"])
+    assert [args["account_id"] for op, args in mail.requests if op == "trash_destination"] == ["work", "personal"]
+    assert [args["ref"]["message_id"] for op, args in mail.requests if op == "move_message"] == [7, 8, 9]
+
+
+def test_trash_messages_reports_rejected_messages_and_moves_the_rest(tmp_path):
+    class StaleEight(FixtureMail):
+        def call(self, operation, args):
+            if operation == "move_message" and args["ref"]["message_id"] == 8:
+                self.requests.append((operation, args))
+                raise BridgeError("Message reference is stale", operation=operation)
+            return super().call(operation, args)
+    mail = StaleEight()
+    server = create_server(bridge=mail, state_dir=tmp_path)
+    refs = [{**REF, "mailbox": ["Deleted Items"]}, {**REF, "message_id": 8}, {**REF, "message_id": 9}]
+    result = call(server, "trash_messages", {"refs": refs})
+    assert result["moved"] == 1 and result["stopped"] == "end" and result["not_attempted"] == []
+    already, stale, moved = result["results"]
+    assert already["moved"] is False and already["retry_safe"] is True and "already in Trash" in already["error"]
+    assert stale["moved"] is False and stale["retry_safe"] is True and "stale" in stale["error"]
+    assert moved["moved"] is True and moved["ref"]["message_id"] == 9
+    assert [args["ref"]["message_id"] for op, args in mail.requests if op == "move_message"] == [8, 9]
+    assert not list(tmp_path.glob("write-uncertain*"))
+
+
+def test_trash_messages_stops_at_an_uncertain_move_and_later_batches_stay_blocked(tmp_path):
+    class UncertainEight(FixtureMail):
+        def call(self, operation, args):
+            if operation == "move_message" and args["ref"]["message_id"] == 8:
+                self.requests.append((operation, args))
+                raise OutcomeUnknown("Mail timed out", operation=operation)
+            return super().call(operation, args)
+    mail = UncertainEight()
+    server = create_server(bridge=mail, state_dir=tmp_path)
+    refs = [REF, {**REF, "message_id": 8}, {**REF, "message_id": 9}]
+    result = call(server, "trash_messages", {"refs": refs})
+    assert result["moved"] == 1 and result["stopped"] == "uncertain_write"
+    moved, uncertain = result["results"]
+    assert moved["moved"] is True
+    assert uncertain["moved"] is False and uncertain["retry_safe"] is False
+    assert "Inspect Mail" in uncertain["error"]
+    assert [ref["message_id"] for ref in result["not_attempted"]] == [9]
+    marker, = tmp_path.glob("write-uncertain-*")
+    assert json.loads(marker.read_text())["target"]["message_id"] == 8
+    again = call(server, "trash_messages", {"refs": [{**REF, "message_id": 9}]})
+    assert again["moved"] == 0 and again["stopped"] == "uncertain_write"
+    assert again["results"][0]["retry_safe"] is True and "uncertain" in again["results"][0]["error"]
+    assert [args["ref"]["message_id"] for op, args in mail.requests if op == "move_message"] == [7, 8]
+
+
+def test_trash_messages_starts_no_move_after_the_time_budget_but_always_tries_one(tmp_path, monkeypatch):
+    monkeypatch.setattr("mail_app_mcp.server.TRASH_BUDGET_SECONDS", 0)
+    mail = FixtureMail()
+    server = create_server(bridge=mail, state_dir=tmp_path)
+    refs = [REF, {**REF, "message_id": 8}, {**REF, "message_id": 9}]
+    result = call(server, "trash_messages", {"refs": refs})
+    assert result["moved"] == 1 and result["stopped"] == "time_budget"
+    assert [ref["message_id"] for ref in result["not_attempted"]] == [8, 9]
+    assert [args["ref"]["message_id"] for op, args in mail.requests if op == "move_message"] == [7]
+
+
+def test_trash_messages_rejects_the_batch_before_any_move_when_a_trash_is_not_allowed(tmp_path):
+    mail = FixtureMail()
+    settings = Settings.model_validate({"accounts": {"personal": {"allowed_destinations": []}}})
+    server = create_server(settings, mail, tmp_path)
+    with pytest.raises(Exception, match="configured"):
+        call(server, "trash_messages", {"refs": [REF, {**REF, "account_id": "personal"}]})
+    assert not [op for op, _ in mail.requests if op == "move_message"]
+    assert not list(tmp_path.glob("write-uncertain*"))
+
+
+@pytest.mark.parametrize("count", [0, 101])
+def test_trash_messages_takes_one_to_a_hundred_refs(tmp_path, count):
+    mail = FixtureMail()
+    with pytest.raises(Exception):
+        call(create_server(bridge=mail, state_dir=tmp_path), "trash_messages", {"refs": [REF] * count})
+    assert not mail.requests
 
 
 @pytest.mark.parametrize("discovered", [

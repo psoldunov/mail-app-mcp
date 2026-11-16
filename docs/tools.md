@@ -1,6 +1,6 @@
 # Tool reference
 
-The server exposes twelve tools over local MCP stdio. The JSON examples are tool argument objects, not shell commands. Replace example IDs, paths, and addresses with values returned by discovery. A Mail tool call launches Mail hidden if it is closed. Existing Mail windows keep their visibility. Startup errors leave the MCP connection open.
+The server exposes thirteen tools over local MCP stdio. The JSON examples are tool argument objects, not shell commands. Replace example IDs, paths, and addresses with values returned by discovery. A Mail tool call launches Mail hidden if it is closed. Existing Mail windows keep their visibility. Startup errors leave the MCP connection open.
 
 Successful tools return JSON objects through the MCP SDK. Validation, policy, and Mail failures are reported as tool errors, not successful empty results. MCP tool annotations describe intent; they do not grant permission or prevent Mail from synchronizing.
 
@@ -251,6 +251,22 @@ Returns `account_id`, `destination`, and `moved: true` only after verification. 
 One required argument: `ref`, the complete message reference.
 
 Moves the message to that account's explicit `trash_mailbox` override, or discovers Mail's actual account Trash when the setting is omitted or `null`. Discovery fails if the result is missing or ambiguous; folder names are never guessed. A discovered path must pass `allowed_destinations`, so an explicit restricted list must contain it. An explicit Trash override authorizes its path independently of that list. Sending and Drafts/Sent destination guards still apply. Already being in the selected Trash is an error. Returns the same fields as `move_message`. No delete command runs, but Mail or provider retention can permanently purge messages afterward.
+
+## trash_messages
+
+| Argument | Required | Meaning |
+| --- | --- | --- |
+| `refs` | Yes | 1 to 100 complete message references, from one or more accounts. |
+
+Trashes each message in order with the same policy, move, and verification as `trash_message`. Before any move, the server resolves each account's Trash once. If any account's Trash cannot be resolved or is not allowed, the whole call fails and nothing moves. A message rejected on its own, such as a stale reference or one already in Trash, is reported and the remaining messages continue.
+
+Returns `moved` (the number of verified moves), `stopped`, `results`, and `not_attempted`. Each entry in `results` has the `ref` and either the `move_message` fields or `moved: false`, `retry_safe`, and `error`. `stopped` is one of:
+
+- `end`: every reference was tried.
+- `time_budget`: 30 seconds passed, so no further move started. Pass `not_attempted` in a new call to continue. Every call tries at least one message.
+- `uncertain_write`: a move's outcome is unknown, or an earlier uncertain write blocks this session. The last result's `error` holds the recovery steps. Do not retry `not_attempted` until the marker is resolved.
+
+The budget leaves the last move time to finish within the 60-second tool timeout that many MCP clients use. The server also runs one tool call at a time, so a longer batch would hold up every other tool. List the affected mailboxes again afterward, because Mail IDs can change after a move.
 
 ## Errors and recovery
 
