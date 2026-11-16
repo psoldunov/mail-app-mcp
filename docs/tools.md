@@ -1,6 +1,6 @@
 # Tool reference
 
-The server exposes thirteen tools over local MCP stdio. The JSON examples are tool argument objects, not shell commands. Replace example IDs, paths, and addresses with values returned by discovery. A Mail tool call launches Mail hidden if it is closed. Existing Mail windows keep their visibility. Startup errors leave the MCP connection open.
+The server exposes fifteen tools over local MCP stdio. The JSON examples are tool argument objects, not shell commands. Replace example IDs, paths, and addresses with values returned by discovery. A Mail tool call launches Mail hidden if it is closed. Existing Mail windows keep their visibility. Startup errors leave the MCP connection open.
 
 Successful tools return JSON objects through the MCP SDK. Validation, policy, and Mail failures are reported as tool errors, not successful empty results. MCP tool annotations describe intent; they do not grant permission or prevent Mail from synchronizing.
 
@@ -231,6 +231,18 @@ Returns `{"shown": true}`. It waits for the shared write lock, but it neither se
 
 At least one of `read` or `flagged` must be supplied as a boolean. Returns `ref`, `read`, and `flagged` after the requested state settles. Verification re-resolves the message every half second and requires three consecutive matching observations, with at most ten polls. If the state does not settle, the call reports an uncertain write and blocks later writes until recovery. This tool changes no other message properties and requires no move policy; Mail or another application can still change the state afterward.
 
+## set_messages_status
+
+| Argument | Default | Meaning |
+| --- | --- | --- |
+| `refs` | Required | 1 to 100 complete message references, from one or more accounts. |
+| `read` | `null` | Applied to every message, as in `set_message_status`. |
+| `flagged` | `null` | Applied to every message, as in `set_message_status`. |
+
+Changes each message in order with the same verification as `set_message_status`. A call with neither `read` nor `flagged` fails before any change. A message rejected on its own, such as a stale reference, is reported and the remaining messages continue.
+
+Returns `updated` (the number of verified changes), `stopped`, `results`, and `not_attempted`, with the same meanings as in [`trash_messages`](#trash_messages). Each entry in `results` has the `ref` and either `updated: true` with the settled `read` and `flagged`, or `updated: false`, `retry_safe`, and `error`. Verification needs at least 1.5 seconds per message, so one call changes about 20 messages at most before the time budget stops it. Pass `not_attempted` in a new call to continue.
+
 ## move_message
 
 | Argument | Required | Meaning |
@@ -245,6 +257,17 @@ A move requires a nonempty Message-ID unique in the source and absent from the d
 The native `move` command timed out and misfiled a Gmail label move in field testing. Mailbox assignment restores the earlier write method while retaining fresh verification. Its behavior on Gmail labels still needs supervised acceptance testing; a timeout may complete later. Inspect both mailboxes before clearing an uncertain-write marker, and do not retry automatically.
 
 Returns `account_id`, `destination`, and `moved: true` only after verification. It does not return a new reference: list the destination mailbox again before another operation because Mail IDs can change after a move.
+
+## move_messages
+
+| Argument | Required | Meaning |
+| --- | --- | --- |
+| `refs` | Yes | 1 to 100 complete message references, all from the same account. |
+| `destination` | Yes | Exact mailbox path in that account, subject to its destination restrictions. |
+
+Moves each message in order with the same checks, move, and verification as `move_message`. Before any move, the server checks the destination against the account's policy once. References from more than one account, or a destination the policy does not allow, fail the whole call and nothing moves. To move messages from several accounts, make one call per account. A message rejected on its own, such as a stale reference or one already in the destination, is reported and the remaining messages continue.
+
+Returns `moved`, `stopped`, `results`, and `not_attempted` in the same form as [`trash_messages`](#trash_messages). List both mailboxes again afterward, because Mail IDs can change after a move.
 
 ## trash_message
 

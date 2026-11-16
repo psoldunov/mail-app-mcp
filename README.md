@@ -11,7 +11,7 @@ The first Mail tool call launches Mail hidden if it is closed. An already-runnin
 | Discover and read | Discover accounts and nested mailboxes; search senders across accounts in received-date order; list or search one mailbox; read plain-text content and extracted HTML links. |
 | Attachments | Read downloaded attachments up to 10 MiB. Extract bounded text/PDF content; return other files up to 1 MiB as base64. No OCR. |
 | Drafts and windows | Save new plain-text drafts and reply drafts using an explicit account sender, and get back a reference to the saved copy; optionally show them in Mail. Show an identified message or saved draft. No editing existing drafts or attaching local files. |
-| Organize | Change read/flag status and verify it settles; move one message within the same account, subject to optional destination restrictions. |
+| Organize | Change read/flag status and verify it settles; move messages within the same account, subject to optional destination restrictions. Each works on one message or up to 100 in one call. |
 | Trash | Move one message, or up to 100 in one call, to Mail's actual Trash for the account or an explicit mapping, subject to destination restrictions. Mail or the provider may later purge it. |
 
 All accounts visible to Mail are discoverable, including the `__local__` identity for On My Mac. Without a policy, ordinary same-account moves are allowed. Account policy can restrict destinations; it is not a read-access restriction. Drafts and status changes work without a move policy. Starting Mail can trigger its normal synchronization, rules, and queued mail. Startup failures leave the MCP connection open.
