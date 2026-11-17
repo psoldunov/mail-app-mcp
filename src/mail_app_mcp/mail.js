@@ -18,12 +18,14 @@ var SAVED_DRAFT_WAIT_MS = 30000;
 var SECOND_SAVE_AFTER_MS = 3000;
 var SETTLE_POLLS = 5;
 var MAX_SEARCH_MATCHES = 20000;
-var STATUS_POLLS = 10;
 var STATUS_SETTLE_POLLS = 3;
-var MOVE_POLLS = 10;
-// A batch starts no write after this, which leaves the last one time to finish inside the 60-second tool
-// timeout common to MCP clients.
-var BATCH_BUDGET_MS = 30000;
+// How long a write is given to show in Mail, polled every half second. A count of polls alone is no time
+// limit, because a poll also reads from Mail: in one live run Trash kept listing a message for more than
+// seven seconds after it had reached the inbox.
+var SETTLE_MS = 20000;
+// A batch starts no write after this. With SETTLE_MS for the last group, a call still ends inside the 60
+// seconds that the bridge and most MCP clients allow.
+var BATCH_BUDGET_MS = 25000;
 // How many writes of a batch are verified together, and so how many can be unverified at once.
 var BATCH_CHUNK = 25;
 var REDISCOVER = '; call list_messages again and use the fresh ref. Draft autosave can change both IDs';
@@ -157,18 +159,29 @@ function sameBox(box, accountId, path) {
   return identity.account_id === accountId && JSON.stringify(identity.mailbox) === JSON.stringify(path);
 }
 
+// The account's mailboxes, each with the identity read for it: about half a second of Apple events for
+// ten mailboxes, so callers pass the result on instead of reading the identities again.
 function accountBoxes(mail, accountId) {
   var boxes = accountId === '__local__' ? mail.mailboxes() : accountFor(mail, accountId).mailboxes();
   requireValue(boxes.length <= MAX_BOXES, 'Mailbox hierarchy too large');
-  return boxes.filter(function (box) { return boxIdentity(box).account_id === accountId; });
+  return boxes.map(function (box) { return { box: box, identity: boxIdentity(box) }; })
+    .filter(function (listed) { return listed.identity.account_id === accountId; });
 }
 
-function boxFor(mail, accountId, path) {
-  var box = one(accountBoxes(mail, accountId).filter(function (candidate) {
-    return sameBox(candidate, accountId, path);
-  }), 'Mailbox');
-  requireValue(sameBox(box, accountId, path), 'Mailbox identity changed');
-  return box;
+function boxAt(boxes, accountId, paths, label) {
+  var box = one(boxes.filter(function (listed) {
+    return paths.some(function (path) { return JSON.stringify(listed.identity.mailbox) === JSON.stringify(path); });
+  }), label).box;
+  // Read again, in case the mailbox was renamed or moved after the account was listed.
+  var identity = boxIdentity(box);
+  requireValue(identity.account_id === accountId && paths.some(function (path) {
+    return JSON.stringify(identity.mailbox) === JSON.stringify(path);
+  }), 'Mailbox identity changed');
+  return { box: box, identity: identity };
+}
+
+function boxFor(mail, accountId, path, boxes) {
+  return boxAt(boxes || accountBoxes(mail, accountId), accountId, [path], 'Mailbox').box;
 }
 
 function messageFor(mail, ref) {
@@ -189,10 +202,10 @@ function listAccounts(mail) {
 }
 
 function listMailboxes(mail, args) {
-  var result = accountBoxes(mail, args.account_id).map(function (box) {
-    var identity = boxIdentity(box);
+  var result = accountBoxes(mail, args.account_id).map(function (listed) {
+    var identity = boxIdentity(listed.box);
     requireValue(identity.account_id === args.account_id, 'Mailbox identity changed');
-    return { account_id: args.account_id, path: identity.mailbox, unread_count: box.unreadCount() };
+    return { account_id: args.account_id, path: identity.mailbox, unread_count: listed.box.unreadCount() };
   });
   return { mailboxes: result };
 }
@@ -214,10 +227,8 @@ function trashDestination(mail, args) {
     box.mailboxes().forEach(function (child) { visit(child, depth + 1); });
   }
   visit(mail.trashMailbox(), 0);
-  var box = one(boxes.filter(function (candidate) {
-    return paths.some(function (path) { return sameBox(candidate, args.account_id, path); });
-  }), 'Trash mailbox');
-  return { account_id: args.account_id, destination: boxIdentity(box).mailbox };
+  return { account_id: args.account_id,
+    destination: boxAt(boxes, args.account_id, paths, 'Trash mailbox').identity.mailbox };
 }
 
 function summary(message, accountId, mailbox) {
@@ -523,8 +534,9 @@ function memo(key, compute) {
 // about a second of Apple events, and reading a property of every message in a mailbox up to another. A
 // batch pays for each once per mailbox or per group of messages, not once per message.
 function writeSession(mail) {
+  var boxes = memo(JSON.stringify, function (accountId) { return accountBoxes(mail, accountId); });
   var box = memo(function (accountId, path) { return JSON.stringify([accountId, path]); },
-    function (accountId, path) { return boxFor(mail, accountId, path); });
+    function (accountId, path) { return boxFor(mail, accountId, path, boxes(accountId)); });
   var screen = memo(function (candidate, destination) { return destination + Automation.getDisplayString(candidate); },
     function (candidate, destination) { rejectUnsafeBox(mail, candidate, destination); });
   var listings = {};
@@ -559,6 +571,15 @@ function writeSession(mail) {
       // A whose match names the message through the mailbox that stores it (All Mail for a Gmail label).
       return function () { return home.messages.byId(ref.message_id); };
     } };
+}
+
+// Calls poll every half second until it returns true, or until the write has had SETTLE_MS.
+function settle(poll) {
+  var deadline = Date.now() + SETTLE_MS;
+  for (var polls = 0; polls < SETTLE_MS / 500; polls += 1) {
+    pause(0.5);
+    if (poll() || Date.now() >= deadline) return;
+  }
 }
 
 function report(error, retrySafe) {
@@ -649,8 +670,7 @@ function statusSteps(mail, args) {
     verify: function (states) {
       var seen = states.map(function () { return { stable: 0 }; });
       function settling(now) { return now.stable < STATUS_SETTLE_POLLS; }
-      for (var poll = 0; poll < STATUS_POLLS && seen.some(settling); poll += 1) {
-        pause(0.5);
+      settle(function () {
         seen = states.map(function (state, index) {
           if (!settling(seen[index])) return seen[index];
           var current = state.locate();
@@ -659,7 +679,8 @@ function statusSteps(mail, args) {
           var matches = (args.read == null || read === args.read) && (args.flagged == null || flagged === args.flagged);
           return { stable: matches ? seen[index].stable + 1 : 0, read: read, flagged: flagged };
         });
-      }
+        return !seen.some(settling);
+      });
       session.forget();
       return states.map(function (state, index) {
         return !settling(seen[index]) && { ref: state.ref, read: seen[index].read, flagged: seen[index].flagged };
@@ -702,15 +723,15 @@ function moveSteps(mail, destinationFor) {
     },
     verify: function (states) {
       var moved = states.map(function () { return false; });
-      for (var poll = 0; poll < MOVE_POLLS && moved.indexOf(false) !== -1; poll += 1) {
-        pause(0.5);
+      settle(function () {
         // A move invalidates the source handle and may give the destination copy a new numeric ID, so only
         // fresh listings can prove it. The last ones also serve the checks of the next group.
         session.forget();
         moved = states.map(function (state, index) {
           return moved[index] || (lists(state.ref, state.ref.mailbox) === 0 && lists(state.ref, state.path) === 1);
         });
-      }
+        return moved.indexOf(false) === -1;
+      });
       return states.map(function (state, index) {
         return moved[index] && { account_id: state.ref.account_id, destination: state.path, moved: true };
       });

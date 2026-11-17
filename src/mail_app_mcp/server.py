@@ -325,7 +325,7 @@ def create_server(settings: Settings | None = None, bridge=None, state_dir: Path
 
         Refs may span accounts. Each ref is checked like set_message_status; changes are verified in groups of
         up to 25. A rejected message is reported in results and the rest continue. stopped says why the call
-        ended: end, time_budget (no change starts after 30 seconds; pass not_attempted again) or uncertain_write
+        ended: end, time_budget (no change starts after 25 seconds; pass not_attempted again) or uncertain_write
         (results with retry_safe false could not be verified; do not retry, follow their recovery steps).
         """
         if read is None and flagged is None:
@@ -349,7 +349,7 @@ def create_server(settings: Settings | None = None, bridge=None, state_dir: Path
         Every ref must name the same account; destination is a path in it, checked against policy before any move.
         Each ref is checked like move_message; moves are verified in groups of up to 25. A rejected message is
         reported in results and the rest continue. stopped says why the call ended: end, time_budget (no move
-        starts after 30 seconds; pass not_attempted again) or uncertain_write (results with retry_safe false
+        starts after 25 seconds; pass not_attempted again) or uncertain_write (results with retry_safe false
         could not be verified; do not retry, follow their recovery steps).
         """
         if len({ref.account_id for ref in refs}) != 1:
@@ -378,7 +378,7 @@ def create_server(settings: Settings | None = None, bridge=None, state_dir: Path
 
         Every account's Trash is resolved before any move. Each ref is checked like trash_message; moves are
         verified in groups of up to 25. A rejected message is reported in results and the rest continue. stopped
-        says why the call ended: end, time_budget (no move starts after 30 seconds; pass not_attempted again) or
+        says why the call ended: end, time_budget (no move starts after 25 seconds; pass not_attempted again) or
         uncertain_write (results with retry_safe false could not be verified; do not retry, follow their
         recovery steps).
         """

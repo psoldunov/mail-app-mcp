@@ -386,7 +386,7 @@ test('status verification rejects cached success when freshly resolved state rev
   assert.throws(() => dispatch(mail, 'set_message_status', { ref, read: false, flagged: true }),
     /Outcome unknown:.*Status verification failed/);
   assert.equal(original.readStatus(), false, 'The setters reached the message');
-  assert.ok(resolutions <= 12, 'Verification must stop after bounded polling');
+  assert.ok(resolutions <= 42, 'Verification must stop after bounded polling');
 });
 
 test('moves within account and rejects resolved special destinations and stale source', () => {
@@ -1376,7 +1376,7 @@ function refs(ref, ids) {
   return ids.map((id) => ({ ...ref, message_id: id, header_message_id: `<${id}@example.com>` }));
 }
 
-test('a batch moves every message in one call and resolves each mailbox once, not once per message', () => {
+test('a batch moves every message in one call and lists the account\'s mailboxes once, not once per message', () => {
   const { mail, account, inbox, archive, ref } = fixture(3);
   filing(mail, inbox);
   const boxes = account.mailboxes;
@@ -1389,7 +1389,7 @@ test('a batch moves every message in one call and resolves each mailbox once, no
   });
   assert.deepEqual(archive.messages.id(), [1, 2, 3]);
   assert.equal(inbox.messages.length, 0);
-  assert.equal(listings, 2, 'One listing each for the source and the destination');
+  assert.equal(listings, 1, 'The source and the destination come from the same listing');
 });
 
 test('a batch reports a rejected message and carries on with the rest', () => {
@@ -1433,7 +1433,7 @@ test('after the first, writes are verified in groups of 25 with one wait each, a
   assert.ok(result.results.every((item, index) => index === 2 || item.moved === true));
   assert.equal(archive.messages.length, 25);
   assert.deepEqual(inbox.messages.id(), [3, 27, 28]);
-  assert.equal(waits.mock.callCount(), 1 + 10, 'One wait for message 1, then the ten polls a failed group gets');
+  assert.equal(waits.mock.callCount(), 1 + 40, 'One wait for message 1, then the forty polls a failed group gets');
 });
 
 test('a full batch waits once per group, not once per message', (t) => {
@@ -1512,7 +1512,7 @@ test('a mailbox a batch may not use is rejected for every message without being 
   const result = dispatch(mail, 'move_messages', { refs: refs(ref, [1, 2, 3]), destinations: { a1: ['Nowhere'] } });
   assert.equal(result.stopped, 'end');
   assert.ok(result.results.every((item) => /^Mailbox missing or ambiguous/.test(item.error)));
-  assert.equal(listings, 2);
+  assert.equal(listings, 1);
   assert.equal(inbox.messages.length, 3);
 });
 
@@ -1614,4 +1614,51 @@ test('a write that Mail refuses stops the batch at once, without finishing its g
   assert.equal(result.results[2].apple_script_error_number, -10000);
   assert.deepEqual(archive.messages.id(), [1, 2], 'Message 2 was written before the refusal and is still verified');
   assert.deepEqual(inbox.messages.id(), [3, 4, 5, 6]);
+});
+
+test('a mailbox is resolved from one reading of each identity, then read again before it is used', () => {
+  const { mail, account, inbox, archive } = fixture();
+  const args = { account_id: 'a1', mailbox: ['Archive'], offset: 0, limit: 1, query: '', search_body: false };
+  const reads = new Map();
+  const counted = (box, name) => new Proxy(box, { get(target, key) {
+    if (key !== 'name') return target[key];
+    reads.set(target, (reads.get(target) || 0) + 1);
+    return () => name(reads.get(target));
+  } });
+  account.mailboxes = collection(account.mailboxes().map((box) => counted(box, () => box.name())));
+  dispatch(mail, 'list_messages', args);
+  assert.equal(reads.get(inbox), 1, 'A mailbox that was not asked for is identified once');
+  assert.equal(reads.get(archive), 2, 'The chosen mailbox is identified again');
+  // Renamed between the listing and its use.
+  account.mailboxes = collection(account.mailboxes().map((box) => box.specifier === archive.specifier
+    ? counted(archive, (read) => read > 3 ? 'Renamed' : 'Archive') : box));
+  assert.throws(() => dispatch(mail, 'list_messages', args), /Mailbox identity changed/);
+});
+
+test('a move that Mail is slow to show is verified when it shows, well past ten polls', (t) => {
+  const { mail, inbox, archive, messages, ref } = fixture(1);
+  let waits = 0;
+  t.mock.method(global.$.NSThread, 'sleepForTimeInterval', () => {
+    waits += 1;
+    if (waits === 25) inbox.messages = collection([]);
+  });
+  // The message reaches the destination at once but stays listed in the source for twelve seconds.
+  inbox.messages = collection([new Proxy(messages[0], { set(target, key, value) {
+    value.messages = collection([target]);
+    return true;
+  } })]);
+  assert.equal(dispatch(mail, 'move_message', { ref, destination: ['Archive'] }).moved, true);
+  assert.equal(waits, 25);
+  assert.deepEqual(archive.messages.id(), [1]);
+});
+
+test('verification gives up once a write has had its time, however few polls that took', (t) => {
+  const { mail, ref } = fixture(1);
+  let now = 0;
+  t.mock.method(Date, 'now', () => now);
+  // Each poll takes six seconds, as reading a very large mailbox can.
+  const waits = t.mock.method(global.$.NSThread, 'sleepForTimeInterval', () => { now += 6000; });
+  assert.throws(() => dispatch(mail, 'move_message', { ref, destination: ['Archive'] }),
+    /Outcome unknown:.*Move verification failed/);
+  assert.equal(waits.mock.callCount(), 4, 'The fourth poll ends after the twenty seconds a write is given');
 });
