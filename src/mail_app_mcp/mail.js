@@ -1,7 +1,8 @@
 'use strict';
 
 var OPERATIONS = ['list_accounts', 'list_mailboxes', 'trash_destination', 'list_messages', 'search_messages', 'confirm_messages',
-  'read_message', 'save_attachment', 'set_message_status', 'move_message', 'create_draft', 'reply_draft', 'show_message'];
+  'read_message', 'save_attachment', 'set_message_status', 'set_messages_status', 'move_message', 'move_messages',
+  'create_draft', 'reply_draft', 'show_message'];
 // Failures of these leave no uncertain mail state; showing a message only opens a window.
 var RETRY_SAFE_OPERATIONS = ['list_accounts', 'list_mailboxes', 'trash_destination', 'list_messages', 'search_messages', 'confirm_messages',
   'read_message', 'save_attachment', 'show_message'];
@@ -20,6 +21,12 @@ var MAX_SEARCH_MATCHES = 20000;
 var STATUS_POLLS = 10;
 var STATUS_SETTLE_POLLS = 3;
 var MOVE_POLLS = 10;
+// A batch starts no write after this, which leaves the last one time to finish inside the 60-second tool
+// timeout common to MCP clients.
+var BATCH_BUDGET_MS = 30000;
+// How many writes of a batch are verified together, and so how many can be unverified at once.
+var BATCH_CHUNK = 25;
+var REDISCOVER = '; call list_messages again and use the fresh ref. Draft autosave can change both IDs';
 var MAIL_STARTUP_SECONDS = 15;
 // A cold first search over ~40 Gmail mailboxes took 20 s; warm ones take ~4 s. The bridge stops at 60 s.
 var GLOBAL_SEARCH_BUDGET_MS = 35000;
@@ -38,6 +45,11 @@ function integer(value, min, max) {
 }
 function validPath(path) {
   return Array.isArray(path) && path.length > 0 && path.length <= 20 && path.every(string);
+}
+function validRef(ref) {
+  return Boolean(ref) && string(ref.account_id) && validPath(ref.mailbox) &&
+    integer(ref.message_id, 1, Number.MAX_SAFE_INTEGER) && typeof ref.header_message_id === 'string' &&
+    ref.header_message_id.length <= 2048;
 }
 function validate(operation, args) {
   requireValue(OPERATIONS.indexOf(operation) !== -1, 'Unsupported operation');
@@ -70,10 +82,11 @@ function validate(operation, args) {
       }), 'Invalid confirmation request');
   }
   if (['read_message', 'save_attachment', 'set_message_status', 'move_message', 'reply_draft', 'show_message'].indexOf(operation) !== -1) {
-    var ref = args.ref;
-    requireValue(ref && string(ref.account_id) && validPath(ref.mailbox) &&
-      integer(ref.message_id, 1, Number.MAX_SAFE_INTEGER) && typeof ref.header_message_id === 'string' &&
-      ref.header_message_id.length <= 2048, 'Invalid reference');
+    requireValue(validRef(args.ref), 'Invalid reference');
+  }
+  if (operation === 'set_messages_status' || operation === 'move_messages') {
+    requireValue(Array.isArray(args.refs) && args.refs.length >= 1 && args.refs.length <= 100 &&
+      args.refs.every(validRef), 'Invalid references');
   }
   if (operation === 'read_message') requireValue(integer(args.max_chars, 1, 100000), 'Invalid body limit');
   if (operation === 'save_attachment') {
@@ -81,7 +94,12 @@ function validate(operation, args) {
       args.path.indexOf('\0') === -1 && integer(args.max_bytes, 1, Number.MAX_SAFE_INTEGER), 'Invalid attachment request');
   }
   if (operation === 'move_message') requireValue(validPath(args.destination), 'Invalid destination');
-  if (operation === 'set_message_status') {
+  if (operation === 'move_messages') {
+    requireValue(args.destinations && typeof args.destinations === 'object' && args.refs.every(function (ref) {
+      return validPath(args.destinations[ref.account_id]);
+    }), 'Invalid destination');
+  }
+  if (operation === 'set_message_status' || operation === 'set_messages_status') {
     requireValue([args.read, args.flagged].every(function (value) { return value == null || typeof value === 'boolean'; }) &&
       (typeof args.read === 'boolean' || typeof args.flagged === 'boolean'), 'Invalid status');
   }
@@ -156,12 +174,11 @@ function boxFor(mail, accountId, path) {
 function messageFor(mail, ref) {
   // A ref may name any mailbox that lists the message, such as a Gmail label stored in All Mail.
   var box = boxFor(mail, ref.account_id, ref.mailbox);
-  var rediscover = '; call list_messages again and use the fresh ref. Draft autosave can change both IDs';
   var matches = box.messages.whose({ id: ref.message_id })();
-  requireValue(matches.length === 1, 'Message missing or ambiguous' + rediscover);
+  requireValue(matches.length === 1, 'Message missing or ambiguous' + REDISCOVER);
   var message = matches[0];
   requireValue(message.id() === ref.message_id && message.messageId() === ref.header_message_id,
-    'Message reference is stale' + rediscover);
+    'Message reference is stale' + REDISCOVER);
   return message;
 }
 
@@ -210,8 +227,8 @@ function summary(message, accountId, mailbox) {
   read: message.readStatus(), flagged: message.flaggedStatus() };
 }
 
-function bulkIds(messages) {
-  try { return messages.id(); }
+function bulk(messages, property) {
+  try { return messages[property](); }
   catch (error) {
     // Mail cannot bulk-read some empty special mailboxes, such as Gmail's Notes, but counts them as empty.
     if (error.errorNumber === -1728 && messages.length === 0) return [];
@@ -222,7 +239,7 @@ function bulkIds(messages) {
 function mailboxSnapshot(box) {
   // One whole-mailbox property read is a single Apple event; index and range reads cost one per message.
   var messages = box.messages;
-  var ids = bulkIds(messages);
+  var ids = bulk(messages, 'id');
   if (!ids.length) return { ids: [], subjects: [], senders: [], dates: [], read: [], flagged: [], messageIds: [] };
   var snapshot = { ids: ids, subjects: messages.subject(), senders: messages.sender(),
     dates: messages.dateReceived(), read: messages.readStatus(), flagged: messages.flaggedStatus(),
@@ -310,7 +327,7 @@ function searchCandidates(scope, args, remaining) {
   // Subjects and bodies of nonmatches are never fetched.
   var sender = args.from;
   var messages = scope.box.messages;
-  var ids = bulkIds(messages);
+  var ids = bulk(messages, 'id');
   if (!ids.length) return [];
   var senders = sender ? messages.sender() : ids;
   var dates = messages.dateReceived();
@@ -472,70 +489,232 @@ function rejectUnsafeBox(mail, box, destination) {
   specials.forEach(function (special) { visit(special, 0); });
 }
 
+function unknown(error) {
+  var failure = new Error('Outcome unknown: mutation was attempted. Do not retry automatically. ' + String(error.message || error).slice(0, 1000));
+  failure.safeMessage = true;
+  failure.errorNumber = error.errorNumber;
+  return failure;
+}
+
 function mutation(action) {
   try { return action(); }
-  catch (error) {
-    var failure = new Error('Outcome unknown: mutation was attempted. Do not retry automatically. ' + String(error.message || error).slice(0, 1000));
-    failure.safeMessage = true;
-    failure.errorNumber = error.errorNumber;
-    throw failure;
+  catch (error) { throw unknown(error); }
+}
+
+function count(values, value) {
+  return values.filter(function (candidate) { return candidate === value; }).length;
+}
+
+// Remembers each answer, or the rejection thrown instead, under the name key gives the arguments.
+function memo(key, compute) {
+  var known = {};
+  return function () {
+    var name = key.apply(null, arguments);
+    if (!Object.prototype.hasOwnProperty.call(known, name)) {
+      try { known[name] = { value: compute.apply(null, arguments) }; }
+      catch (error) { known[name] = { error: error }; }
+    }
+    if (known[name].error) throw known[name].error;
+    return known[name].value;
+  };
+}
+
+// The lookups one write call shares. Resolving a mailbox, or checking that it is safe to write to, costs
+// about a second of Apple events, and reading a property of every message in a mailbox up to another. A
+// batch pays for each once per mailbox or per group of messages, not once per message.
+function writeSession(mail) {
+  var box = memo(function (accountId, path) { return JSON.stringify([accountId, path]); },
+    function (accountId, path) { return boxFor(mail, accountId, path); });
+  var screen = memo(function (candidate, destination) { return destination + Automation.getDisplayString(candidate); },
+    function (candidate, destination) { rejectUnsafeBox(mail, candidate, destination); });
+  var listings = {};
+  // One property of every message a mailbox lists, read in a single Apple event and kept until forget().
+  function listing(accountId, path, property, added) {
+    var name = JSON.stringify([accountId, path, property]);
+    if (!listings[name]) listings[name] = bulk(box(accountId, path).messages, property);
+    if (added !== undefined) listings[name] = listings[name].concat([added]);
+    return listings[name];
+  }
+  return { box: box, screen: screen, listing: listing,
+    forget: function () { listings = {}; },
+    // Checks a ref as messageFor does, and that its message may be written. Returns a function that gives
+    // a new reference to the message on every call, because JXA can cache properties on a reference.
+    message: function (ref) {
+      var listed = box(ref.account_id, ref.mailbox);
+      // A direct reference resolves through any mailbox of the account, so the mailbox's own IDs prove
+      // that it lists the message. One read of them replaces a whose lookup that rescans the mailbox.
+      requireValue(count(listing(ref.account_id, ref.mailbox, 'id'), ref.message_id) === 1,
+        'Message missing or ambiguous' + REDISCOVER);
+      var found = listed.messages.byId(ref.message_id);
+      var home;
+      try {
+        requireValue(found.messageId() === ref.header_message_id, 'Message reference is stale' + REDISCOVER);
+        home = found.mailbox();
+      } catch (error) {
+        // The message left after its mailbox's IDs were read.
+        requireValue(error.errorNumber !== -1728, 'Message missing or ambiguous' + REDISCOVER);
+        throw error;
+      }
+      screen(home, false);
+      // A whose match names the message through the mailbox that stores it (All Mail for a Gmail label).
+      return function () { return home.messages.byId(ref.message_id); };
+    } };
+}
+
+function report(error, retrySafe) {
+  var detail = String(error.message || error).slice(0, 1000);
+  return { apple_script_error_number: typeof error.errorNumber === 'number' ? error.errorNumber : null,
+    error: error.safeMessage || retrySafe ? detail : 'Outcome unknown: ' + detail };
+}
+
+function outcomeUnknown(result) {
+  return typeof result.error === 'string' && result.error.indexOf('Outcome unknown:') === 0;
+}
+
+// A write in three steps: check(ref) rejects a ref before anything changes and returns what the others
+// need, write(state) changes Mail, and verify(states) returns for each state the result Mail now shows,
+// or a falsy value if the change did not show within the polls.
+function writeOne(steps, ref) {
+  var state = steps.check(ref);
+  return mutation(function () {
+    steps.write(state);
+    var result = steps.verify([state])[0];
+    requireValue(result, steps.unsettled);
+    return result;
+  });
+}
+
+function verified(steps, states) {
+  try {
+    return steps.verify(states).map(function (result) {
+      return result || report(unknown(new Error(steps.unsettled)), false);
+    });
+  } catch (error) {
+    return states.map(function () { return report(unknown(error), false); });
   }
 }
 
-function setStatus(mail, args) {
-  var message = messageFor(mail, args.ref);
-  rejectUnsafeBox(mail, message.mailbox(), false);
-  return mutation(function () {
-    if (typeof args.read === 'boolean') message.readStatus = args.read;
-    if (typeof args.flagged === 'boolean') message.flaggedStatus = args.flagged;
-    var stable = 0;
-    for (var poll = 0; poll < STATUS_POLLS; poll += 1) {
-      pause(0.5);
-      // JXA can return cached properties on the object used for the setters.
-      var current = messageFor(mail, args.ref);
-      var read = current.readStatus();
-      var flagged = current.flaggedStatus();
-      var matches = (args.read == null || read === args.read) && (args.flagged == null || flagged === args.flagged);
-      stable = matches ? stable + 1 : 0;
-      if (stable >= STATUS_SETTLE_POLLS) return { ref: args.ref, read: read, flagged: flagged };
-    }
-    requireValue(false, 'Status verification failed; requested state did not settle');
-  });
+function attempt(steps, ref) {
+  var state;
+  try { state = steps.check(ref); }
+  catch (error) { return { ref: ref, failed: report(error, false) }; }
+  try { steps.write(state); }
+  catch (error) { return { ref: ref, failed: report(unknown(error), false) }; }
+  return { ref: ref, state: state };
 }
 
-function moveMessage(mail, args) {
-  var message = messageFor(mail, args.ref);
-  var destination = boxFor(mail, args.ref.account_id, args.destination);
-  rejectUnsafeBox(mail, message.mailbox(), false);
-  rejectUnsafeBox(mail, destination, true);
-  requireValue(JSON.stringify(args.ref.mailbox) !== JSON.stringify(args.destination), 'Message is already in destination');
-  requireValue(string(args.ref.header_message_id), 'A nonempty Message-ID is required to verify a move');
-  requireValue(destination.messages.whose({ messageId: args.ref.header_message_id })().length === 0,
-    'Destination already contains this Message-ID; overlapping-label moves are unsupported. ' +
-    'For Gmail All Mail, archive in Mail instead. No move was attempted');
-  requireValue(boxFor(mail, args.ref.account_id, args.ref.mailbox).messages
-    .whose({ messageId: args.ref.header_message_id })().length === 1, 'Source Message-ID is ambiguous');
-  return mutation(function () {
-    // Mail's move command timed out and misfiled a Gmail label move; use its writable mailbox property.
-    try { message.mailbox = destination; }
-    catch (error) {
-      // Mail may invalidate the source specifier after completing the assignment.
-      if (error.errorNumber !== -1728) throw error;
-    }
-    for (var poll = 0; poll < MOVE_POLLS; poll += 1) {
-      pause(0.5);
-      // A move invalidates the source handle and may give the destination copy a new numeric ID.
-      var source = boxFor(mail, args.ref.account_id, args.ref.mailbox);
-      var target = boxFor(mail, args.ref.account_id, args.destination);
-      var remaining = source.messages.whose({ messageId: args.ref.header_message_id })();
-      var arrived = target.messages.whose({ messageId: args.ref.header_message_id })();
-      if (remaining.length === 0 && arrived.length === 1) {
-        return { account_id: args.ref.account_id, destination: args.destination, moved: true };
+// Writes a batch in order and reports every outcome. Each message is checked and written on its own, but
+// writes are verified a group at a time, so the wait and the whole-mailbox reads of a verification are
+// shared by up to BATCH_CHUNK messages. The first write is verified alone: one that goes wrong for every
+// message stops there. Nothing starts after the time budget, or once an outcome is unknown.
+function writeEach(refs, steps) {
+  var deadline = Date.now() + BATCH_BUDGET_MS;
+  var results = [];
+  var stopped = 'end';
+  var group = 1;
+  while (stopped === 'end' && results.length < refs.length) {
+    var entries = [];
+    var states = [];
+    while (stopped === 'end' && states.length < group && results.length + entries.length < refs.length) {
+      // The first message always runs, so a call cannot return without trying anything.
+      if (results.length + entries.length && Date.now() >= deadline) stopped = 'time_budget';
+      else {
+        var entry = attempt(steps, refs[results.length + entries.length]);
+        entries = entries.concat([entry]);
+        if (entry.state) states = states.concat([entry.state]);
+        else if (outcomeUnknown(entry.failed)) stopped = 'uncertain_write';
       }
     }
-    requireValue(false, 'Move verification failed: message must leave the source and exist in the destination. ' +
-      'Gmail All Mail may require archiving in Mail; no delete fallback was attempted');
-  });
+    var shown = states.length ? verified(steps, states) : [];
+    var settled = entries.map(function (item) {
+      return Object.assign({ ref: item.ref }, item.failed || shown[states.indexOf(item.state)]);
+    });
+    if (settled.some(outcomeUnknown)) stopped = 'uncertain_write';
+    if (states.length) group = BATCH_CHUNK;
+    results = results.concat(settled);
+  }
+  return { stopped: stopped, results: results };
+}
+
+function statusSteps(mail, args) {
+  var session = writeSession(mail);
+  return {
+    unsettled: 'Status verification failed; requested state did not settle',
+    check: function (ref) { return { ref: ref, locate: session.message(ref) }; },
+    write: function (state) {
+      var message = state.locate();
+      if (typeof args.read === 'boolean') message.readStatus = args.read;
+      if (typeof args.flagged === 'boolean') message.flaggedStatus = args.flagged;
+    },
+    verify: function (states) {
+      var seen = states.map(function () { return { stable: 0 }; });
+      function settling(now) { return now.stable < STATUS_SETTLE_POLLS; }
+      for (var poll = 0; poll < STATUS_POLLS && seen.some(settling); poll += 1) {
+        pause(0.5);
+        seen = states.map(function (state, index) {
+          if (!settling(seen[index])) return seen[index];
+          var current = state.locate();
+          var read = current.readStatus();
+          var flagged = current.flaggedStatus();
+          var matches = (args.read == null || read === args.read) && (args.flagged == null || flagged === args.flagged);
+          return { stable: matches ? seen[index].stable + 1 : 0, read: read, flagged: flagged };
+        });
+      }
+      session.forget();
+      return states.map(function (state, index) {
+        return !settling(seen[index]) && { ref: state.ref, read: seen[index].read, flagged: seen[index].flagged };
+      });
+    } };
+}
+
+function moveSteps(mail, destinationFor) {
+  var session = writeSession(mail);
+  // How often a mailbox lists the ref's Message-ID.
+  function lists(ref, path) {
+    return count(session.listing(ref.account_id, path, 'messageId'), ref.header_message_id);
+  }
+  return {
+    unsettled: 'Move verification failed: message must leave the source and exist in the destination. ' +
+      'Gmail All Mail may require archiving in Mail; no delete fallback was attempted',
+    check: function (ref) {
+      var path = destinationFor(ref);
+      var locate = session.message(ref);
+      var destination = session.box(ref.account_id, path);
+      session.screen(destination, true);
+      requireValue(JSON.stringify(ref.mailbox) !== JSON.stringify(path), 'Message is already in destination');
+      requireValue(string(ref.header_message_id), 'A nonempty Message-ID is required to verify a move');
+      requireValue(lists(ref, path) === 0,
+        'Destination already contains this Message-ID; overlapping-label moves are unsupported. ' +
+        'For Gmail All Mail, archive in Mail instead. No move was attempted');
+      requireValue(lists(ref, ref.mailbox) === 1, 'Source Message-ID is ambiguous');
+      return { ref: ref, path: path, locate: locate, destination: destination };
+    },
+    write: function (state) {
+      // Mail's move command timed out and misfiled a Gmail label move; use its writable mailbox property.
+      try { state.locate().mailbox = state.destination; }
+      catch (error) {
+        // Mail may invalidate the source specifier after completing the assignment.
+        if (error.errorNumber !== -1728) throw error;
+      }
+      // Until the next reading, the destination counts as listing this message, so another copy of it
+      // later in the group is rejected as it would be after a fresh reading.
+      session.listing(state.ref.account_id, state.path, 'messageId', state.ref.header_message_id);
+    },
+    verify: function (states) {
+      var moved = states.map(function () { return false; });
+      for (var poll = 0; poll < MOVE_POLLS && moved.indexOf(false) !== -1; poll += 1) {
+        pause(0.5);
+        // A move invalidates the source handle and may give the destination copy a new numeric ID, so only
+        // fresh listings can prove it. The last ones also serve the checks of the next group.
+        session.forget();
+        moved = states.map(function (state, index) {
+          return moved[index] || (lists(state.ref, state.ref.mailbox) === 0 && lists(state.ref, state.path) === 1);
+        });
+      }
+      return states.map(function (state, index) {
+        return moved[index] && { account_id: state.ref.account_id, destination: state.path, moved: true };
+      });
+    } };
 }
 
 function saveAttachment(mail, args) {
@@ -720,8 +899,10 @@ function dispatch(mail, operation, args) {
   case 'confirm_messages': return confirmMessages(mail, args);
   case 'read_message': return readMessage(mail, args);
   case 'save_attachment': return saveAttachment(mail, args);
-  case 'set_message_status': return setStatus(mail, args);
-  case 'move_message': return moveMessage(mail, args);
+  case 'set_message_status': return writeOne(statusSteps(mail, args), args.ref);
+  case 'set_messages_status': return writeEach(args.refs, statusSteps(mail, args));
+  case 'move_message': return writeOne(moveSteps(mail, function () { return args.destination; }), args.ref);
+  case 'move_messages': return writeEach(args.refs, moveSteps(mail, function (ref) { return args.destinations[ref.account_id]; }));
   case 'create_draft': return createDraft(mail, args);
   case 'reply_draft': return replyDraft(mail, args);
   case 'show_message': return showMessage(mail, args);
@@ -776,11 +957,8 @@ function run() {
     return JSON.stringify({ ok: true, result: dispatch(mail, request.operation, request.args) });
   } catch (error) {
     var operation = request && request.operation;
-    var retrySafe = RETRY_SAFE_OPERATIONS.indexOf(operation) !== -1;
-    var detail = String(error.message || error).slice(0, 1000);
-    return JSON.stringify({ ok: false, operation: operation,
-      apple_script_error_number: typeof error.errorNumber === 'number' ? error.errorNumber : null,
-      error: error.safeMessage || retrySafe ? detail : 'Outcome unknown: ' + detail });
+    return JSON.stringify(Object.assign({ ok: false, operation: operation },
+      report(error, RETRY_SAFE_OPERATIONS.indexOf(operation) !== -1)));
   }
 }
 

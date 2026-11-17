@@ -358,14 +358,14 @@ test('status verification reacquires the message until delayed changes settle', 
   const original = messages[0];
   let elapsed = 0;
   t.mock.method(global.$.NSThread, 'sleepForTimeInterval', (seconds) => { elapsed += seconds; });
-  inbox.messages.whose = () => collection([new Proxy(original, {
+  inbox.messages.byId = () => new Proxy(original, {
     get(target, key) {
       if (key === 'readStatus') return () => elapsed < 1 ? true : false;
       if (key === 'flaggedStatus') return () => elapsed >= 1;
       return target[key];
     },
     set() { return true; },
-  })]);
+  });
   assert.deepEqual(dispatch(mail, 'set_message_status', { ref, read: false, flagged: true }),
     { ref, read: false, flagged: true });
   assert.ok(elapsed >= 2, 'A transient matching poll must not confirm success');
@@ -375,15 +375,17 @@ test('status verification rejects cached success when freshly resolved state rev
   const { mail, ref, inbox, messages } = fixture();
   const original = messages[0];
   let resolutions = 0;
-  inbox.messages.whose = () => collection([++resolutions === 1 ? original : new Proxy(original, {
+  // The first two references check the ref and take the setters; every later one is a verification poll.
+  inbox.messages.byId = () => ++resolutions <= 2 ? original : new Proxy(original, {
     get(target, key) {
       if (key === 'readStatus') return () => true;
       if (key === 'flaggedStatus') return () => false;
       return target[key];
     },
-  })]);
+  });
   assert.throws(() => dispatch(mail, 'set_message_status', { ref, read: false, flagged: true }),
     /Outcome unknown:.*Status verification failed/);
+  assert.equal(original.readStatus(), false, 'The setters reached the message');
   assert.ok(resolutions <= 12, 'Verification must stop after bounded polling');
 });
 
@@ -969,6 +971,13 @@ test('invalid requests fail before accessing Mail', () => {
     ['move_message', { ref, destination: [] }],
     ['set_message_status', { ref, read: null, flagged: null }],
     ['set_message_status', { ref, read: 'true' }],
+    ['set_messages_status', { refs: [ref], read: null, flagged: null }],
+    ['set_messages_status', { refs: [], read: true }],
+    ['set_messages_status', { refs: [ref, { ...ref, message_id: 0 }], read: true }],
+    ['move_messages', { refs: Array(101).fill(ref), destinations: { a1: ['Archive'] } }],
+    ['move_messages', { refs: [ref, { ...ref, account_id: 'a2' }], destinations: { a1: ['Archive'] } }],
+    ['move_messages', { refs: [{ ...ref, account_id: 'constructor' }], destinations: {} }],
+    ['move_messages', { refs: [ref] }],
     ['save_attachment', { ref, attachment_id: 'a', path: '../escape', max_bytes: 1 }],
     ['reply_draft', { ref, sender: 'me@example.com', body: '', reply_all: 1 }],
     ['read_message', { ref: { ...ref, message_id: 0 }, max_chars: 1 }],
@@ -1351,4 +1360,258 @@ test('confirmation rejects malformed nominations before touching Mail', () => {
     [{ ...good, message_id: 0 }], [{ ...good, account_id: '' }], [{ ...good, timestamp: '0' }], [null]]) {
     assert.throws(() => dispatch(mail, 'confirm_messages', { messages }), /Invalid/);
   }
+});
+
+// Fake Mail files a message when its mailbox is assigned, as the real one does.
+function filing(mail, box) {
+  const transfer = mail.move;
+  box.messages = collection(box.messages().map((message) => new Proxy(message, { set(target, key, value) {
+    assert.equal(key, 'mailbox');
+    transfer(target, { to: value });
+    return true;
+  } })));
+}
+
+function refs(ref, ids) {
+  return ids.map((id) => ({ ...ref, message_id: id, header_message_id: `<${id}@example.com>` }));
+}
+
+test('a batch moves every message in one call and resolves each mailbox once, not once per message', () => {
+  const { mail, account, inbox, archive, ref } = fixture(3);
+  filing(mail, inbox);
+  const boxes = account.mailboxes;
+  let listings = 0;
+  account.mailboxes = () => { listings += 1; return boxes(); };
+  const batch = refs(ref, [1, 2, 3]);
+  assert.deepEqual(dispatch(mail, 'move_messages', { refs: batch, destinations: { a1: ['Archive'] } }), {
+    stopped: 'end',
+    results: batch.map((item) => ({ ref: item, account_id: 'a1', destination: ['Archive'], moved: true })),
+  });
+  assert.deepEqual(archive.messages.id(), [1, 2, 3]);
+  assert.equal(inbox.messages.length, 0);
+  assert.equal(listings, 2, 'One listing each for the source and the destination');
+});
+
+test('a batch reports a rejected message and carries on with the rest', () => {
+  const { mail, inbox, archive, ref } = fixture(3);
+  filing(mail, inbox);
+  const [first, second, third] = refs(ref, [1, 2, 3]);
+  const batch = [first, { ...second, header_message_id: 'old' }, refs(ref, [9])[0], third];
+  const result = dispatch(mail, 'move_messages', { refs: batch, destinations: { a1: ['Archive'] } });
+  assert.equal(result.stopped, 'end');
+  assert.deepEqual(result.results.map((item) => item.ref), batch);
+  assert.deepEqual(result.results.map((item) => item.moved === true), [true, false, false, true]);
+  assert.match(result.results[1].error, /^Message reference is stale/);
+  assert.match(result.results[2].error, /^Message missing/);
+  assert.deepEqual(archive.messages.id(), [1, 3]);
+  assert.deepEqual(inbox.messages.id(), [2]);
+});
+
+test('the first write of a batch is verified alone, so a move that fails every time stops at one message', () => {
+  const { mail, inbox, archive, messages, ref } = fixture(3);
+  // Mail accepts every assignment but files nothing.
+  inbox.messages = collection(messages.map((message) => new Proxy(message, { set() { return true; } })));
+  const result = dispatch(mail, 'move_messages', { refs: refs(ref, [1, 2, 3]), destinations: { a1: ['Archive'] } });
+  assert.equal(result.stopped, 'uncertain_write');
+  assert.equal(result.results.length, 1, 'Nothing was written after the first message');
+  assert.match(result.results[0].error, /^Outcome unknown:.*Move verification failed/);
+  assert.equal(archive.messages.length, 0);
+});
+
+test('after the first, writes are verified in groups of 25 with one wait each, and a batch stops at a group it cannot verify', (t) => {
+  const { mail, inbox, archive, messages, ref } = fixture(28);
+  filing(mail, inbox);
+  // Mail accepts the assignment for message 3 but never files it.
+  inbox.messages = collection(inbox.messages().map((message) => message.id() === 3
+    ? new Proxy(messages[2], { set() { return true; } }) : message));
+  const waits = t.mock.method(global.$.NSThread, 'sleepForTimeInterval', () => {});
+  const ids = Array.from({ length: 28 }, (_, index) => index + 1);
+  const result = dispatch(mail, 'move_messages', { refs: refs(ref, ids), destinations: { a1: ['Archive'] } });
+  assert.equal(result.stopped, 'uncertain_write');
+  assert.equal(result.results.length, 26, 'Message 1 alone, then one group of 25; the last two were not attempted');
+  assert.match(result.results[2].error, /^Outcome unknown:.*Move verification failed/);
+  assert.ok(result.results.every((item, index) => index === 2 || item.moved === true));
+  assert.equal(archive.messages.length, 25);
+  assert.deepEqual(inbox.messages.id(), [3, 27, 28]);
+  assert.equal(waits.mock.callCount(), 1 + 10, 'One wait for message 1, then the ten polls a failed group gets');
+});
+
+test('a full batch waits once per group, not once per message', (t) => {
+  const { mail, inbox, archive, ref } = fixture(60);
+  filing(mail, inbox);
+  const waits = t.mock.method(global.$.NSThread, 'sleepForTimeInterval', () => {});
+  const ids = Array.from({ length: 60 }, (_, index) => index + 1);
+  const result = dispatch(mail, 'move_messages', { refs: refs(ref, ids), destinations: { a1: ['Archive'] } });
+  assert.equal(result.stopped, 'end');
+  assert.deepEqual(result.results.map((item) => item.ref.message_id), ids);
+  assert.equal(archive.messages.length, 60);
+  assert.equal(waits.mock.callCount(), 4, 'Groups of 1, 25, 25 and 9');
+});
+
+test('a copy of a message moved earlier in the same group is rejected, as a fresh reading would reject it', () => {
+  const { mail, account, inbox, archive, messages, ref } = fixture(2);
+  const other = Object.assign(scripting({ name: 'Other', account, container: null, unreadCount: 0 }),
+    { mailboxes: collection([]) });
+  account.mailboxes = collection([...account.mailboxes(), other]);
+  const copy = scripting({ id: 5, messageId: '<2@example.com>', mailbox: other });
+  other.messages = collection([copy]);
+  filing(mail, inbox);
+  filing(mail, other);
+  const [first, second] = refs(ref, [1, 2]);
+  const result = dispatch(mail, 'move_messages', { destinations: { a1: ['Archive'] },
+    refs: [first, second, { ...second, mailbox: ['Other'], message_id: 5 }] });
+  assert.equal(result.stopped, 'end');
+  assert.deepEqual(result.results.map((item) => item.moved === true), [true, true, false]);
+  assert.match(result.results[2].error, /^Destination already contains this Message-ID/);
+  assert.deepEqual(archive.messages.id(), [1, 2]);
+  assert.deepEqual(other.messages.id(), [5]);
+});
+
+test('a batch starts no write after its time budget, but always tries the first message', (t) => {
+  let now = 0;
+  t.mock.method(Date, 'now', () => now);
+  for (const [millisecondsPerWrite, attempted] of [[12000, 3], [40000, 1]]) {
+    const { mail, inbox, ref } = fixture(5);
+    const transfer = mail.move;
+    inbox.messages = collection(inbox.messages().map((message) => new Proxy(message, { set(target, key, value) {
+      now += millisecondsPerWrite;
+      transfer(target, { to: value });
+      return true;
+    } })));
+    now = 0;
+    const result = dispatch(mail, 'move_messages', { refs: refs(ref, [1, 2, 3, 4, 5]), destinations: { a1: ['Archive'] } });
+    assert.equal(result.stopped, 'time_budget');
+    assert.deepEqual(result.results.map((item) => item.moved), Array(attempted).fill(true));
+    assert.equal(inbox.messages.length, 5 - attempted);
+  }
+});
+
+test('a batch files each account in its own destination', () => {
+  const { mail, inbox, archive, ref } = fixture(1);
+  const other = fixture(1);
+  other.account.id = 'a2';
+  other.archive.name = 'Filed';
+  mail.accounts = collection([...mail.accounts(), other.account]);
+  filing(mail, inbox);
+  filing(other.mail, other.inbox);
+  const result = dispatch(mail, 'move_messages', { refs: [ref, { ...ref, account_id: 'a2' }],
+    destinations: { a1: ['Archive'], a2: ['Filed'] } });
+  assert.equal(result.stopped, 'end');
+  assert.deepEqual(result.results.map((item) => [item.account_id, item.destination, item.moved]),
+    [['a1', ['Archive'], true], ['a2', ['Filed'], true]]);
+  assert.deepEqual(archive.messages.id(), [1]);
+  assert.deepEqual(other.archive.messages.id(), [1]);
+});
+
+test('a mailbox a batch may not use is rejected for every message without being resolved again', () => {
+  const { mail, account, inbox, ref } = fixture(3);
+  filing(mail, inbox);
+  const boxes = account.mailboxes;
+  let listings = 0;
+  account.mailboxes = () => { listings += 1; return boxes(); };
+  const result = dispatch(mail, 'move_messages', { refs: refs(ref, [1, 2, 3]), destinations: { a1: ['Nowhere'] } });
+  assert.equal(result.stopped, 'end');
+  assert.ok(result.results.every((item) => /^Mailbox missing or ambiguous/.test(item.error)));
+  assert.equal(listings, 2);
+  assert.equal(inbox.messages.length, 3);
+});
+
+test('a batch sets status on every message and verifies a group together, reporting each settled state', (t) => {
+  const { mail, messages, ref } = fixture(5);
+  const batch = refs(ref, [1, 2, 3, 4, 5]);
+  const waits = t.mock.method(global.$.NSThread, 'sleepForTimeInterval', () => {});
+  const result = dispatch(mail, 'set_messages_status', {
+    refs: [batch[0], { ...batch[1], header_message_id: 'old' }, batch[2], batch[3], batch[4]], read: true, flagged: null });
+  assert.equal(result.stopped, 'end');
+  assert.deepEqual(result.results[0], { ref: batch[0], read: true, flagged: false });
+  assert.match(result.results[1].error, /^Message reference is stale/);
+  assert.deepEqual(result.results.slice(2), batch.slice(2).map((item) => ({ ref: item, read: true, flagged: false })));
+  assert.deepEqual(messages.map((message) => message.readStatus()), [true, false, true, true, true]);
+  assert.equal(waits.mock.callCount(), 6, 'Three settling polls for message 1, three for the group after it');
+});
+
+test('a status batch stops at a group with a change that does not settle', () => {
+  const { mail, inbox, messages, ref } = fixture(4);
+  const batch = refs(ref, [1, 2, 3, 4]);
+  // Mail accepts the flag on message 2 but never shows it.
+  inbox.messages.byId = (id) => id === 2 ? new Proxy(messages[1], { set() { return true; } }) : messages[id - 1];
+  const result = dispatch(mail, 'set_messages_status', { refs: batch, read: null, flagged: true });
+  assert.equal(result.stopped, 'uncertain_write');
+  assert.deepEqual(result.results.map((item) => item.flagged), [true, undefined, true, true]);
+  assert.match(result.results[1].error, /^Outcome unknown:.*Status verification failed/);
+  assert.deepEqual(messages.map((message) => message.flaggedStatus()), [true, false, true, true]);
+});
+
+test('a write needs its mailbox to list the message, though Mail resolves an ID through any mailbox', () => {
+  const { mail, inbox, archive, messages, ref } = fixture(2);
+  mail.move(messages[1], { to: archive });
+  inbox.messages.byId = (id) => messages[id - 1];
+  const moved = refs(ref, [2])[0];
+  assert.throws(() => dispatch(mail, 'set_message_status', { ref: moved, read: true }), /^Error: Message missing/);
+  assert.equal(messages[1].readStatus(), false);
+  assert.deepEqual(dispatch(mail, 'set_message_status', { ref: { ...moved, mailbox: ['Archive'] }, read: true }),
+    { ref: { ...moved, mailbox: ['Archive'] }, read: true, flagged: false });
+});
+
+test('a message listed under a label is written through the mailbox that stores it', () => {
+  const { mail, account, inbox, archive, messages, ref } = fixture(1);
+  // Gmail: INBOX lists the message, All Mail stores it, and Mail names the message through All Mail.
+  const all = Object.assign(scripting({ name: 'All Mail', account, container: null, unreadCount: 0 }),
+    { mailboxes: collection([]) });
+  account.mailboxes = collection([...account.mailboxes(), all]);
+  messages[0].mailbox = all;
+  const listing = (trap) => new Proxy(messages[0], { set: trap });
+  inbox.messages = collection([listing(() => assert.fail('Written through the label'))]);
+  all.messages = collection([listing((target, key, value) => {
+    assert.equal(key, 'mailbox');
+    inbox.messages = collection([]);
+    all.messages = collection([]);
+    value.messages = collection([target]);
+    return true;
+  })]);
+  assert.equal(dispatch(mail, 'move_message', { ref, destination: ['Archive'] }).moved, true);
+  assert.deepEqual(archive.messages.id(), [1]);
+});
+
+test('a message that leaves while its ref is being checked is a plain rejection, and nothing is written', () => {
+  const { mail, inbox, ref } = fixture(1);
+  inbox.messages.byId = () => new Proxy({}, {
+    get() { throw Object.assign(new Error("Can't get object"), { errorNumber: -1728 }); },
+    set() { assert.fail('Written after the message left'); },
+  });
+  const result = dispatch(mail, 'set_messages_status', { refs: [ref], read: true, flagged: null });
+  assert.equal(result.stopped, 'end');
+  assert.match(result.results[0].error, /^Message missing/);
+  assert.throws(() => dispatch(mail, 'move_message', { ref, destination: ['Archive'] }), /^Error: Message missing/);
+});
+
+test('each group checks its refs against a fresh reading of the mailbox', (t) => {
+  const { mail, inbox, messages, ref } = fixture(27);
+  let waits = 0;
+  // Message 27 leaves the inbox while the first write is being verified, two groups before its turn.
+  t.mock.method(global.$.NSThread, 'sleepForTimeInterval', () => {
+    waits += 1;
+    if (waits === 1) inbox.messages = collection(messages.slice(0, 26));
+  });
+  const ids = Array.from({ length: 27 }, (_, index) => index + 1);
+  const result = dispatch(mail, 'set_messages_status', { refs: refs(ref, ids), read: true, flagged: null });
+  assert.equal(result.stopped, 'end');
+  assert.ok(result.results.slice(0, 26).every((item) => item.read === true));
+  assert.match(result.results[26].error, /^Message missing/);
+  assert.equal(messages[26].readStatus(), false);
+});
+
+test('a write that Mail refuses stops the batch at once, without finishing its group', () => {
+  const { mail, inbox, archive, messages, ref } = fixture(6);
+  filing(mail, inbox);
+  inbox.messages = collection(inbox.messages().map((message) => message.id() === 3
+    ? new Proxy(messages[2], { set() { throw Object.assign(new Error('Mail got an error'), { errorNumber: -10000 }); } })
+    : message));
+  const result = dispatch(mail, 'move_messages', { refs: refs(ref, [1, 2, 3, 4, 5, 6]), destinations: { a1: ['Archive'] } });
+  assert.equal(result.stopped, 'uncertain_write');
+  assert.deepEqual(result.results.map((item) => item.moved === true), [true, true, false]);
+  assert.match(result.results[2].error, /^Outcome unknown: mutation was attempted.*Mail got an error/);
+  assert.equal(result.results[2].apple_script_error_number, -10000);
+  assert.deepEqual(archive.messages.id(), [1, 2], 'Message 2 was written before the refusal and is still verified');
+  assert.deepEqual(inbox.messages.id(), [3, 4, 5, 6]);
 });

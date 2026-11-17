@@ -229,7 +229,7 @@ Returns `{"shown": true}`. It waits for the shared write lock, but it neither se
 | `read` | `null` | `true` marks read; `false` marks unread; null leaves it unchanged. |
 | `flagged` | `null` | `true` flags; `false` removes the flag; null leaves it unchanged. |
 
-At least one of `read` or `flagged` must be supplied as a boolean. Returns `ref`, `read`, and `flagged` after the requested state settles. Verification re-resolves the message every half second and requires three consecutive matching observations, with at most ten polls. If the state does not settle, the call reports an uncertain write and blocks later writes until recovery. This tool changes no other message properties and requires no move policy; Mail or another application can still change the state afterward.
+At least one of `read` or `flagged` must be supplied as a boolean. Returns `ref`, `read`, and `flagged` after the requested state settles. Verification reads the state through a new reference to the message every half second and requires three consecutive matching observations, with at most ten polls. If the state does not settle, the call reports an uncertain write and blocks later writes until recovery. This tool changes no other message properties and requires no move policy; Mail or another application can still change the state afterward.
 
 ## set_messages_status
 
@@ -239,9 +239,9 @@ At least one of `read` or `flagged` must be supplied as a boolean. Returns `ref`
 | `read` | `null` | Applied to every message, as in `set_message_status`. |
 | `flagged` | `null` | Applied to every message, as in `set_message_status`. |
 
-Changes each message in order with the same verification as `set_message_status`. A call with neither `read` nor `flagged` fails before any change. A message rejected on its own, such as a stale reference, is reported and the remaining messages continue.
+Changes the messages in order. Each reference is checked as in `set_message_status`, and the changes are verified in groups, as described for [`trash_messages`](#trash_messages). A call with neither `read` nor `flagged` fails before any change. A message rejected on its own, such as a stale reference, is reported and the remaining messages continue.
 
-Returns `updated` (the number of verified changes), `stopped`, `results`, and `not_attempted`, with the same meanings as in [`trash_messages`](#trash_messages). Each entry in `results` has the `ref` and either `updated: true` with the settled `read` and `flagged`, or `updated: false`, `retry_safe`, and `error`. Verification needs at least 1.5 seconds per message, so one call changes about 20 messages at most before the time budget stops it. Pass `not_attempted` in a new call to continue.
+Returns `updated` (the number of verified changes), `stopped`, `results`, and `not_attempted`, with the same meanings as in [`trash_messages`](#trash_messages). Each entry in `results` has the `ref` and either `updated: true` with the settled `read` and `flagged`, or `updated: false`, `retry_safe`, and `error`. A group takes at least 1.5 seconds to verify, however many messages it holds. On Mail 16 and macOS 27.2, one call flagged 10 Gmail messages in 5.3 seconds. Pass `not_attempted` in a new call if the time budget stops one.
 
 ## move_message
 
@@ -265,7 +265,7 @@ Returns `account_id`, `destination`, and `moved: true` only after verification. 
 | `refs` | Yes | 1 to 100 complete message references, all from the same account. |
 | `destination` | Yes | Exact mailbox path in that account, subject to its destination restrictions. |
 
-Moves each message in order with the same checks, move, and verification as `move_message`. Before any move, the server checks the destination against the account's policy once. References from more than one account, or a destination the policy does not allow, fail the whole call and nothing moves. To move messages from several accounts, make one call per account. A message rejected on its own, such as a stale reference or one already in the destination, is reported and the remaining messages continue.
+Moves the messages in order with the same checks and move as `move_message`, and verifies the moves in groups, as described for [`trash_messages`](#trash_messages). Before any move, the server checks the destination against the account's policy once. References from more than one account, or a destination the policy does not allow, fail the whole call and nothing moves. To move messages from several accounts, make one call per account. A message rejected on its own, such as a stale reference or one already in the destination, is reported and the remaining messages continue.
 
 Returns `moved`, `stopped`, `results`, and `not_attempted` in the same form as [`trash_messages`](#trash_messages). List both mailboxes again afterward, because Mail IDs can change after a move.
 
@@ -281,13 +281,19 @@ Moves the message to that account's explicit `trash_mailbox` override, or discov
 | --- | --- | --- |
 | `refs` | Yes | 1 to 100 complete message references, from one or more accounts. |
 
-Trashes each message in order with the same policy, move, and verification as `trash_message`. Before any move, the server resolves each account's Trash once. If any account's Trash cannot be resolved or is not allowed, the whole call fails and nothing moves. A message rejected on its own, such as a stale reference or one already in Trash, is reported and the remaining messages continue.
+Trashes the messages in order with the same policy, checks, and move as `trash_message`, and verifies the moves in groups. Before any move, the server resolves each account's Trash once. If any account's Trash cannot be resolved or is not allowed, the whole call fails and nothing moves. A message rejected on its own, such as a stale reference or one already in Trash, is reported and the remaining messages continue.
 
 Returns `moved` (the number of verified moves), `stopped`, `results`, and `not_attempted`. Each entry in `results` has the `ref` and either the `move_message` fields or `moved: false`, `retry_safe`, and `error`. `stopped` is one of:
 
 - `end`: every reference was tried.
 - `time_budget`: 30 seconds passed, so no further move started. Pass `not_attempted` in a new call to continue. Every call tries at least one message.
-- `uncertain_write`: a move's outcome is unknown, or an earlier uncertain write blocks this session. The last result's `error` holds the recovery steps. Do not retry `not_attempted` until the marker is resolved.
+- `uncertain_write`: one or more moves could not be verified. Each of those results has `retry_safe: false` and an `error` with the recovery steps. Do not retry them, or `not_attempted`, until the marker is resolved.
+
+The whole call fails, as a single write does, when an earlier uncertain write blocks the session, or when the Mail session times out or its response is lost. In the second case any message in the call may have moved, and the marker records every reference.
+
+A batch runs in one Mail session. Resolving a mailbox and checking that it may be written to takes about a second, and the session does both once per mailbox, where separate `trash_message` calls repeat them for every message.
+
+Each reference is checked before its message is written, but writes are verified in groups. The first write of a call is verified alone. After that, up to 25 writes are made before one verification covers all of them, so the group shares the half-second wait and one reading of each mailbox. A call stops after a group that holds a write it cannot verify, which means up to 25 writes can be unverified at once, where the single-message tools verify every write before the next. A write that Mail refuses outright stops the call immediately. On Mail 16 and macOS 27.2, trashing 5 messages from a Gmail inbox of about 700 took 8.1 seconds in one call. Most of that is fixed: about 2 seconds to discover Trash and start the session, and 3.5 seconds to resolve and check the two mailboxes. Each further message added about 15 milliseconds for its check and 40 to 70 for its move, and each verification took just under a second. A larger mailbox makes a verification slower, because it reads the Message-IDs of the whole mailbox.
 
 The budget leaves the last move time to finish within the 60-second tool timeout that many MCP clients use. The server also runs one tool call at a time, so a longer batch would hold up every other tool. List the affected mailboxes again afterward, because Mail IDs can change after a move.
 
@@ -297,6 +303,6 @@ Automation errors include the failed operation, bounded underlying automation me
 
 Mail launches asynchronously, hidden and without activation. Before scripting, the server checks launch completion and requires the process to be at least 15 seconds old. An early call reports “Mail is starting” with no write attempted; wait 15 seconds before retrying. This settling window is not a guarantee that Mail has finished synchronizing.
 
-The bridge gives Mail operations 60 seconds. A timeout or failed response after a write can mean Mail accepted the operation but the result was lost. The server then leaves a `write-uncertain-<session-id>` marker that blocks later writes in that server instance until the owner reconciles Mail and clears it. Other instances and restarted servers start unblocked; opening a new chat may reuse an existing server. The record remains on disk after the session ends, but new sessions ignore it. Restarting does not confirm or cancel the operation, so inspect Mail before repeating it from any session. The marker records the operation, its target (message reference, or account and subject for a new draft), start time, process ID, and server build, and every refused write quotes it. Do not automatically retry writes. Reads remain available. See [setup and recovery](setup.md#recover-after-an-uncertain-write).
+The bridge gives Mail operations 60 seconds. A timeout or failed response after a write can mean Mail accepted the operation but the result was lost. The server then leaves a `write-uncertain-<session-id>` marker that blocks later writes in that server instance until the owner reconciles Mail and clears it. Other instances and restarted servers start unblocked; opening a new chat may reuse an existing server. The record remains on disk after the session ends, but new sessions ignore it. Restarting does not confirm or cancel the operation, so inspect Mail before repeating it from any session. The marker records the operation, its target (a message reference, the references a batch could not verify, or account and subject for a new draft), start time, process ID, and server build, and every refused write quotes it. Do not automatically retry writes. Reads remain available. See [setup and recovery](setup.md#recover-after-an-uncertain-write).
 
 There are no send, permanent-delete, empty-Trash, arbitrary-script, rules, account-settings, quit, or runtime-policy tools. [The safety model](safety.md) describes the boundary with other agent tools and Mail itself.

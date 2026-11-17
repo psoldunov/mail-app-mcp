@@ -21,7 +21,7 @@ from mcp.types import ToolAnnotations
 from pydantic import Field, TypeAdapter
 
 from .attachments import guessed_mime
-from .bridge import BridgeError, MailBridge, OutcomeUnknown, write_lock
+from .bridge import BridgeError, MailBridge, OutcomeUnknown, failure, uncertain_error, write_lock
 from .index import MAIL_DATA, received_range, search
 from .links import message_links
 from .models import Address, Body, Draft, Identifier, Mailbox, MessageRef, Settings
@@ -38,8 +38,6 @@ SHOW = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint
 DEFAULT_STATE_DIR = Path.home() / "Library" / "Caches" / "mail-app-mcp"
 MARKER = "write-uncertain"
 MAX_MARKER_BYTES = 16_384
-# Leaves the last write time to finish inside the 60-second tool timeout common to MCP clients.
-BATCH_BUDGET_SECONDS = 30
 log = logging.getLogger("mail_app_mcp")
 
 
@@ -78,7 +76,8 @@ def marker_details(marker: Path) -> str:
 
 
 def write_record(operation: str, arguments: dict) -> bytes:
-    target = arguments.get("ref") or {"account_id": arguments.get("account_id"), "subject": arguments.get("subject")}
+    target = (arguments.get("ref") or arguments.get("refs")
+              or {"account_id": arguments.get("account_id"), "subject": arguments.get("subject")})
     return json.dumps({
         "operation": operation, "target": target, "pid": os.getpid(),
         "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -112,29 +111,41 @@ def clear_uncertain(directory: Path) -> str:
         return "\n".join(reports)
 
 
-def perform_write(bridge, marker: Path, operation: str, arguments: dict) -> dict:
+def with_recovery(error: OutcomeUnknown, marker: Path) -> OutcomeUnknown:
+    return OutcomeUnknown(f"{error.detail} {recovery_steps(marker)}", operation=error.operation,
+                          apple_script_error_number=error.apple_script_error_number)
+
+
+def record(fd: int, operation: str, arguments: dict) -> None:
+    with os.fdopen(fd, "wb") as file:
+        file.write(write_record(operation, arguments))
+
+
+def perform_write(bridge, marker: Path, operation: str, arguments: dict, unverified=lambda result: []) -> dict:
+    """unverified names the refs whose writes a batch result leaves unknown; the marker then stays, recording those."""
     with write_lock(marker.parent):
-        recovery = recovery_steps(marker)
         if os.path.lexists(marker):
             raise ValueError(f"A previous write in this MCP server session has an uncertain outcome. This call attempted no new write. "
-                             f"Marker: {marker_details(marker)}. {recovery}")
+                             f"Marker: {marker_details(marker)}. {recovery_steps(marker)}")
         fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         try:
-            with os.fdopen(fd, "wb") as file:
-                file.write(write_record(operation, arguments))
+            record(fd, operation, arguments)
         except OSError:
             marker.unlink()  # Nothing reached Mail yet.
             raise
         try:
             result = bridge.call(operation, arguments)
         except OutcomeUnknown as exc:
-            raise OutcomeUnknown(f"{exc.detail} {recovery}", operation=exc.operation,
-                                 apple_script_error_number=exc.apple_script_error_number) from exc
+            raise with_recovery(exc, marker) from exc
         except Exception:
             # Validation failures from the fixed script have no side effects.
             marker.unlink()
             raise
-        marker.unlink()
+        refs = unverified(result)  # If this raises, the marker stays: Mail was written to.
+        if refs:
+            record(os.open(marker, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW), operation, {"refs": refs})
+        else:
+            marker.unlink()
         return result
 
 
@@ -273,47 +284,53 @@ def create_server(settings: Settings | None = None, bridge=None, state_dir: Path
         with write_lock(directory):
             return mail.call("show_message", {"ref": ref.model_dump(mode="json")})
 
-    def batch(refs: tuple[MessageRef, ...], write, done: str) -> dict:
-        """Run write on each ref in order; report each outcome under done, and stop at the time budget or an uncertain write."""
-        started = time.monotonic()
-        results, stopped = [], "end"
-        for ref in refs:
-            if results and time.monotonic() - started >= BATCH_BUDGET_SECONDS:
-                stopped = "time_budget"
-                break
-            item = {"ref": ref.model_dump(mode="json")}
-            try:
-                results.append({**item, done: True, **write(ref)})
-            except (BridgeError, ValueError) as exc:
-                results.append({**item, done: False, "retry_safe": getattr(exc, "retry_safe", True), "error": str(exc)})
-                if os.path.lexists(marker):  # This write's outcome is unknown, or an earlier one blocks the session.
-                    stopped = "uncertain_write"
-                    break
-        return {done: sum(item.get(done) is True for item in results), "stopped": stopped, "results": results,
-                "not_attempted": [ref.model_dump(mode="json") for ref in refs[len(results):]]}
+    def batch(refs: tuple[MessageRef, ...], operation: str, arguments: dict, done: str) -> dict:
+        """Write refs in order in one Mail session, which costs far less than a session per message.
 
-    def set_status(ref: MessageRef, read: bool | None, flagged: bool | None) -> dict:
+        The script verifies writes in groups. It stops at its time budget or after a group it cannot verify, and
+        reports each outcome it reached; they are returned under done, and the refs after the last one as
+        not_attempted.
+        """
+        sent = [ref.model_dump(mode="json") for ref in refs]
+
+        def checked(outcome: dict) -> list[tuple[dict, BridgeError | None]]:
+            """Each result with the error it reports, if any. Results must match the refs sent, in order."""
+            results = outcome.get("results")
+            if (outcome.get("stopped") not in ("end", "time_budget", "uncertain_write") or not isinstance(results, list)
+                    or [item.get("ref") if isinstance(item, dict) else None for item in results] != sent[:len(results)]):
+                raise with_recovery(uncertain_error("Mail returned an invalid batch result", operation), marker)
+            return [(item, failure(item["error"], item.get("apple_script_error_number"), operation) if "error" in item else None)
+                    for item in results]
+
+        outcome = perform_write(mail, marker, operation, {**arguments, "refs": sent}, lambda outcome: [
+            item["ref"] for item, error in checked(outcome) if isinstance(error, OutcomeUnknown)])
+        results = [{**item, done: True} if error is None else {
+            "ref": item["ref"], done: False, "retry_safe": error.retry_safe,
+            "error": str(with_recovery(error, marker) if isinstance(error, OutcomeUnknown) else error),
+        } for item, error in checked(outcome)]
+        return {done: sum(item[done] for item in results), "stopped": outcome["stopped"], "results": results,
+                "not_attempted": sent[len(results):]}
+
+    @tool(WRITE)
+    def set_message_status(ref: MessageRef, read: StrictBool | None = None, flagged: StrictBool | None = None) -> dict:
+        """Change only read/unread and flagged status of one revalidated message."""
         if read is None and flagged is None:
             raise ValueError("Provide read or flagged")
         return perform_write(mail, marker, "set_message_status", {
             "ref": ref.model_dump(mode="json"), "read": read, "flagged": flagged})
 
     @tool(WRITE)
-    def set_message_status(ref: MessageRef, read: StrictBool | None = None, flagged: StrictBool | None = None) -> dict:
-        """Change only read/unread and flagged status of one revalidated message."""
-        return set_status(ref, read, flagged)
-
-    @tool(WRITE)
     def set_messages_status(refs: Batch, read: StrictBool | None = None, flagged: StrictBool | None = None) -> dict:
-        """Set read and/or flagged on up to 100 messages in order, each changed and verified like set_message_status.
+        """Set read and/or flagged on up to 100 messages in one call, far faster than one call per message.
 
-        Refs may span accounts. A rejected message is reported in results and the rest continue. stopped says why
-        the call ended: end, time_budget (no change starts after 30 seconds; pass not_attempted again) or
-        uncertain_write (do not retry; follow the error's recovery steps).
+        Refs may span accounts. Each ref is checked like set_message_status; changes are verified in groups of
+        up to 25. A rejected message is reported in results and the rest continue. stopped says why the call
+        ended: end, time_budget (no change starts after 30 seconds; pass not_attempted again) or uncertain_write
+        (results with retry_safe false could not be verified; do not retry, follow their recovery steps).
         """
         if read is None and flagged is None:
             raise ValueError("Provide read or flagged")
-        return batch(refs, lambda ref: set_status(ref, read, flagged), "updated")
+        return batch(refs, "set_messages_status", {"read": read, "flagged": flagged}, "updated")
 
     def move_to(ref: MessageRef, target: list[str], place: str = "the destination mailbox") -> dict:
         if tuple(target) == ref.mailbox:
@@ -327,17 +344,18 @@ def create_server(settings: Settings | None = None, bridge=None, state_dir: Path
 
     @tool(WRITE)
     def move_messages(refs: Batch, destination: Mailbox) -> dict:
-        """Move up to 100 messages from one account in order, each moved and verified like move_message. Re-list afterward.
+        """Move up to 100 messages from one account in one call, far faster than one call per message. Re-list afterward.
 
         Every ref must name the same account; destination is a path in it, checked against policy before any move.
-        A rejected message is reported in results and the rest continue. stopped says why the call ended: end,
-        time_budget (no move starts after 30 seconds; pass not_attempted again) or uncertain_write (do not retry;
-        follow the error's recovery steps).
+        Each ref is checked like move_message; moves are verified in groups of up to 25. A rejected message is
+        reported in results and the rest continue. stopped says why the call ended: end, time_budget (no move
+        starts after 30 seconds; pass not_attempted again) or uncertain_write (results with retry_safe false
+        could not be verified; do not retry, follow their recovery steps).
         """
         if len({ref.account_id for ref in refs}) != 1:
             raise ValueError("All refs must come from one account; destination is a mailbox path in that account")
         target = policy.destination(refs[0].account_id, destination)
-        return batch(refs, lambda ref: move_to(ref, target), "moved")
+        return batch(refs, "move_messages", {"destinations": {refs[0].account_id: target}}, "moved")
 
     def trash_destination(account_id: str) -> list[str]:
         target = policy.trash(account_id)
@@ -356,14 +374,16 @@ def create_server(settings: Settings | None = None, bridge=None, state_dir: Path
 
     @tool(WRITE)
     def trash_messages(refs: Batch) -> dict:
-        """Trash up to 100 messages in order, each moved and verified like trash_message. Re-list afterward.
+        """Trash up to 100 messages in one call, far faster than one call per message. Re-list afterward.
 
-        Every account's Trash is resolved before any move. A rejected message is reported in results and the
-        rest continue. stopped says why the call ended: end, time_budget (no move starts after 30 seconds; pass
-        not_attempted again) or uncertain_write (do not retry; follow the error's recovery steps).
+        Every account's Trash is resolved before any move. Each ref is checked like trash_message; moves are
+        verified in groups of up to 25. A rejected message is reported in results and the rest continue. stopped
+        says why the call ended: end, time_budget (no move starts after 30 seconds; pass not_attempted again) or
+        uncertain_write (results with retry_safe false could not be verified; do not retry, follow their
+        recovery steps).
         """
         targets = {account: trash_destination(account) for account in dict.fromkeys(ref.account_id for ref in refs)}
-        return batch(refs, lambda ref: move_to(ref, targets[ref.account_id], "Trash"), "moved")
+        return batch(refs, "move_messages", {"destinations": targets}, "moved")
 
     return server
 

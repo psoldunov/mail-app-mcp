@@ -34,7 +34,39 @@ class FixtureMail:
                     "ref": {**REF, "mailbox": ["Drafts"], "message_id": 12}}
         if operation == "move_message":
             return {"account_id": args["ref"]["account_id"], "destination": args["destination"], "moved": True}
+        if operation in ("move_messages", "set_messages_status"):
+            return self.batch(operation, args)
         return {"operation": operation, **args}
+
+    def batch(self, operation, args):
+        """Every ref succeeds, as the script reports it: one result per ref, in order."""
+        if operation == "set_messages_status":
+            return {"stopped": "end", "results": [
+                {"ref": ref, "read": bool(args["read"]), "flagged": bool(args["flagged"])} for ref in args["refs"]]}
+        return {"stopped": "end", "results": [
+            {"ref": ref, "account_id": ref["account_id"], "destination": args["destinations"][ref["account_id"]],
+             "moved": True} for ref in args["refs"]]}
+
+
+class FailsEight(FixtureMail):
+    """The script's report when message 8 fails with error: rejected and carried on, or unknown and stopped."""
+
+    def __init__(self, error):
+        super().__init__()
+        self.error = error
+
+    def batch(self, operation, args):
+        complete = super().batch(operation, args)["results"]
+        results = [{"ref": item["ref"], "error": self.error, "apple_script_error_number": None}
+                   if item["ref"]["message_id"] == 8 else item for item in complete]
+        if not self.error.startswith("Outcome unknown:"):
+            return {"stopped": "end", "results": results}
+        last = next(index for index, item in enumerate(results) if "error" in item)
+        return {"stopped": "uncertain_write", "results": results[:last + 1]}
+
+
+def sent(mail, operation):
+    return [args for name, args in mail.requests if name == operation]
 
 
 def call(server, name, arguments):
@@ -87,46 +119,36 @@ def test_default_moves_and_discovered_trash_respect_explicit_restrictions(tmp_pa
     assert len([op for op, _ in mail.requests if op == "move_message"]) == writes_before
 
 
-def test_trash_messages_moves_every_ref_and_discovers_each_accounts_trash_once(tmp_path):
+def test_trash_messages_trashes_every_ref_in_one_mail_call_and_discovers_each_accounts_trash_once(tmp_path):
     mail = FixtureMail()
     server = create_server(bridge=mail, state_dir=tmp_path)
     refs = [REF, {**REF, "message_id": 8}, {**REF, "account_id": "personal", "message_id": 9}]
     result = call(server, "trash_messages", {"refs": refs})
     assert result["moved"] == 3 and result["stopped"] == "end" and result["not_attempted"] == []
-    assert [item["ref"]["message_id"] for item in result["results"]] == [7, 8, 9]
+    assert [item["ref"] for item in result["results"]] == refs
     assert all(item["moved"] is True and item["destination"] == ["Deleted Items"] for item in result["results"])
-    assert [args["account_id"] for op, args in mail.requests if op == "trash_destination"] == ["work", "personal"]
-    assert [args["ref"]["message_id"] for op, args in mail.requests if op == "move_message"] == [7, 8, 9]
-
-
-def test_trash_messages_reports_rejected_messages_and_moves_the_rest(tmp_path):
-    class StaleEight(FixtureMail):
-        def call(self, operation, args):
-            if operation == "move_message" and args["ref"]["message_id"] == 8:
-                self.requests.append((operation, args))
-                raise BridgeError("Message reference is stale", operation=operation)
-            return super().call(operation, args)
-    mail = StaleEight()
-    server = create_server(bridge=mail, state_dir=tmp_path)
-    refs = [{**REF, "mailbox": ["Deleted Items"]}, {**REF, "message_id": 8}, {**REF, "message_id": 9}]
-    result = call(server, "trash_messages", {"refs": refs})
-    assert result["moved"] == 1 and result["stopped"] == "end" and result["not_attempted"] == []
-    already, stale, moved = result["results"]
-    assert already["moved"] is False and already["retry_safe"] is True and "already in Trash" in already["error"]
-    assert stale["moved"] is False and stale["retry_safe"] is True and "stale" in stale["error"]
-    assert moved["moved"] is True and moved["ref"]["message_id"] == 9
-    assert [args["ref"]["message_id"] for op, args in mail.requests if op == "move_message"] == [8, 9]
+    assert [args["account_id"] for args in sent(mail, "trash_destination")] == ["work", "personal"]
+    assert sent(mail, "move_messages") == [
+        {"refs": refs, "destinations": {"work": ["Deleted Items"], "personal": ["Deleted Items"]}}]
+    assert not sent(mail, "move_message")
     assert not list(tmp_path.glob("write-uncertain*"))
 
 
-def test_trash_messages_stops_at_an_uncertain_move_and_later_batches_stay_blocked(tmp_path):
-    class UncertainEight(FixtureMail):
-        def call(self, operation, args):
-            if operation == "move_message" and args["ref"]["message_id"] == 8:
-                self.requests.append((operation, args))
-                raise OutcomeUnknown("Mail timed out", operation=operation)
-            return super().call(operation, args)
-    mail = UncertainEight()
+def test_trash_messages_reports_rejected_messages_and_moves_the_rest(tmp_path):
+    mail = FailsEight("Message reference is stale")
+    server = create_server(bridge=mail, state_dir=tmp_path)
+    refs = [REF, {**REF, "message_id": 8}, {**REF, "message_id": 9}]
+    result = call(server, "trash_messages", {"refs": refs})
+    assert result["moved"] == 2 and result["stopped"] == "end" and result["not_attempted"] == []
+    first, stale, last = result["results"]
+    assert first["moved"] is True and last["moved"] is True and last["ref"]["message_id"] == 9
+    assert stale == {"ref": refs[1], "moved": False, "retry_safe": True,
+                     "error": "move_messages: Message reference is stale (retry_safe=true)"}
+    assert not list(tmp_path.glob("write-uncertain*"))
+
+
+def test_trash_messages_stops_at_an_uncertain_move_and_later_writes_stay_blocked(tmp_path):
+    mail = FailsEight("Outcome unknown: mutation was attempted. Do not retry automatically. Move verification failed")
     server = create_server(bridge=mail, state_dir=tmp_path)
     refs = [REF, {**REF, "message_id": 8}, {**REF, "message_id": 9}]
     result = call(server, "trash_messages", {"refs": refs})
@@ -134,25 +156,61 @@ def test_trash_messages_stops_at_an_uncertain_move_and_later_batches_stay_blocke
     moved, uncertain = result["results"]
     assert moved["moved"] is True
     assert uncertain["moved"] is False and uncertain["retry_safe"] is False
-    assert "Inspect Mail" in uncertain["error"]
-    assert [ref["message_id"] for ref in result["not_attempted"]] == [9]
+    assert "Move verification failed" in uncertain["error"] and "Inspect Mail" in uncertain["error"]
+    assert result["not_attempted"] == [refs[2]]
     marker, = tmp_path.glob("write-uncertain-*")
-    assert json.loads(marker.read_text())["target"]["message_id"] == 8
-    again = call(server, "trash_messages", {"refs": [{**REF, "message_id": 9}]})
-    assert again["moved"] == 0 and again["stopped"] == "uncertain_write"
-    assert again["results"][0]["retry_safe"] is True and "uncertain" in again["results"][0]["error"]
-    assert [args["ref"]["message_id"] for op, args in mail.requests if op == "move_message"] == [7, 8]
+    record = json.loads(marker.read_text())
+    assert record["operation"] == "move_messages" and record["target"] == [refs[1]]
+    with pytest.raises(Exception, match="uncertain") as blocked:
+        call(server, "trash_messages", {"refs": [refs[2]]})
+    assert '"message_id": 8' in str(blocked.value) and '"message_id": 7' not in str(blocked.value)
+    with pytest.raises(Exception, match="uncertain"):
+        call(server, "set_message_status", {"ref": REF, "read": True})
+    assert len(sent(mail, "move_messages")) == 1 and not sent(mail, "set_message_status")
 
 
-def test_trash_messages_starts_no_move_after_the_time_budget_but_always_tries_one(tmp_path, monkeypatch):
-    monkeypatch.setattr("mail_app_mcp.server.BATCH_BUDGET_SECONDS", 0)
+def test_a_batch_whose_mail_call_is_lost_leaves_every_ref_uncertain(tmp_path):
     mail = FixtureMail()
     server = create_server(bridge=mail, state_dir=tmp_path)
+    refs = [REF, {**REF, "message_id": 8}]
+    mail.fail_write = True
+    with pytest.raises(Exception, match="Inspect Mail"):
+        call(server, "trash_messages", {"refs": refs})
+    marker, = tmp_path.glob("write-uncertain-*")
+    assert json.loads(marker.read_text())["target"] == refs
+    mail.fail_write = False
+    with pytest.raises(Exception, match="uncertain"):
+        call(server, "set_messages_status", {"refs": refs, "read": True})
+    assert len(sent(mail, "move_messages")) == 1 and not sent(mail, "set_messages_status")
+
+
+def test_trash_messages_returns_what_the_time_budget_left_unattempted(tmp_path):
+    class OutOfTime(FixtureMail):
+        def batch(self, operation, args):
+            return {"stopped": "time_budget", "results": super().batch(operation, args)["results"][:1]}
+    server = create_server(bridge=OutOfTime(), state_dir=tmp_path)
     refs = [REF, {**REF, "message_id": 8}, {**REF, "message_id": 9}]
     result = call(server, "trash_messages", {"refs": refs})
     assert result["moved"] == 1 and result["stopped"] == "time_budget"
-    assert [ref["message_id"] for ref in result["not_attempted"]] == [8, 9]
-    assert [args["ref"]["message_id"] for op, args in mail.requests if op == "move_message"] == [7]
+    assert result["not_attempted"] == refs[1:]
+    assert not list(tmp_path.glob("write-uncertain*"))
+
+
+@pytest.mark.parametrize("outcome", [
+    {"stopped": "end"},
+    {"stopped": "done", "results": []},
+    {"stopped": "end", "results": [{"ref": {**REF, "message_id": 99}, "moved": True}]},
+    {"stopped": "end", "results": [{"ref": REF, "moved": True}, {"ref": REF, "moved": True}]},
+    {"stopped": "end", "results": ["moved"]},
+])
+def test_a_batch_result_that_does_not_match_its_refs_is_an_uncertain_write(tmp_path, outcome):
+    class Garbled(FixtureMail):
+        def batch(self, operation, args):
+            return outcome
+    server = create_server(bridge=Garbled(), state_dir=tmp_path)
+    with pytest.raises(Exception, match="invalid batch result.*Inspect Mail"):
+        call(server, "trash_messages", {"refs": [REF]})
+    assert len(list(tmp_path.glob("write-uncertain-*"))) == 1
 
 
 def test_trash_messages_rejects_the_batch_before_any_move_when_a_trash_is_not_allowed(tmp_path):
@@ -161,7 +219,7 @@ def test_trash_messages_rejects_the_batch_before_any_move_when_a_trash_is_not_al
     server = create_server(settings, mail, tmp_path)
     with pytest.raises(Exception, match="configured"):
         call(server, "trash_messages", {"refs": [REF, {**REF, "account_id": "personal"}]})
-    assert not [op for op, _ in mail.requests if op == "move_message"]
+    assert not sent(mail, "move_messages")
     assert not list(tmp_path.glob("write-uncertain*"))
 
 
@@ -175,17 +233,15 @@ def test_batch_tools_take_one_to_a_hundred_refs(tmp_path, count, name, extra):
     assert not mail.requests
 
 
-def test_move_messages_moves_every_ref_and_reports_ones_already_there(tmp_path):
+def test_move_messages_moves_every_ref_in_one_mail_call(tmp_path):
     mail = FixtureMail()
     settings = Settings.model_validate({"accounts": {"work": {"allowed_destinations": [["Archive"]]}}})
     server = create_server(settings, mail, tmp_path)
-    refs = [REF, {**REF, "mailbox": ["Archive"], "message_id": 8}, {**REF, "message_id": 9}]
+    refs = [REF, {**REF, "mailbox": ["Sent"], "message_id": 8}]
     result = call(server, "move_messages", {"refs": refs, "destination": ["Archive"]})
     assert result["moved"] == 2 and result["stopped"] == "end" and result["not_attempted"] == []
-    first, already, last = result["results"]
-    assert first["moved"] is True and first["destination"] == ["Archive"] and last["moved"] is True
-    assert already["moved"] is False and already["retry_safe"] is True and "already in the destination" in already["error"]
-    assert [args["ref"]["message_id"] for op, args in mail.requests if op == "move_message"] == [7, 9]
+    assert all(item["moved"] is True and item["destination"] == ["Archive"] for item in result["results"])
+    assert sent(mail, "move_messages") == [{"refs": refs, "destinations": {"work": ["Archive"]}}]
 
 
 @pytest.mark.parametrize("refs, destination, error", [
@@ -198,48 +254,35 @@ def test_move_messages_rejects_the_batch_before_any_move(tmp_path, refs, destina
     server = create_server(settings, mail, tmp_path)
     with pytest.raises(Exception, match=error):
         call(server, "move_messages", {"refs": refs, "destination": destination})
-    assert not [op for op, _ in mail.requests if op == "move_message"]
+    assert not sent(mail, "move_messages")
     assert not list(tmp_path.glob("write-uncertain*"))
 
 
-def test_set_messages_status_updates_refs_across_accounts_and_reports_rejections(tmp_path):
-    class StaleEight(FixtureMail):
-        def call(self, operation, args):
-            if operation == "set_message_status" and args["ref"]["message_id"] == 8:
-                self.requests.append((operation, args))
-                raise BridgeError("Message reference is stale", operation=operation)
-            return super().call(operation, args)
-    mail = StaleEight()
+def test_set_messages_status_updates_refs_across_accounts_in_one_mail_call_and_reports_rejections(tmp_path):
+    mail = FailsEight("Message reference is stale")
     server = create_server(bridge=mail, state_dir=tmp_path)
     refs = [REF, {**REF, "message_id": 8}, {**REF, "account_id": "personal", "message_id": 9}]
     result = call(server, "set_messages_status", {"refs": refs, "read": True, "flagged": False})
     assert result["updated"] == 2 and result["stopped"] == "end" and result["not_attempted"] == []
     done, stale, other = result["results"]
-    assert done["updated"] is True and done["read"] is True and done["flagged"] is False
+    assert done == {"ref": REF, "updated": True, "read": True, "flagged": False}
     assert stale["updated"] is False and stale["retry_safe"] is True and "stale" in stale["error"]
     assert other["updated"] is True and other["ref"]["account_id"] == "personal"
-    writes = [args for op, args in mail.requests if op == "set_message_status"]
-    assert [(args["ref"]["message_id"], args["read"], args["flagged"]) for args in writes] == [
-        (7, True, False), (8, True, False), (9, True, False)]
+    assert sent(mail, "set_messages_status") == [{"refs": refs, "read": True, "flagged": False}]
     with pytest.raises(Exception, match="Provide"):
         call(server, "set_messages_status", {"refs": refs})
 
 
 def test_set_messages_status_stops_at_an_uncertain_change(tmp_path):
-    class UncertainEight(FixtureMail):
-        def call(self, operation, args):
-            if operation == "set_message_status" and args["ref"]["message_id"] == 8:
-                self.requests.append((operation, args))
-                raise OutcomeUnknown("Mail timed out", operation=operation)
-            return super().call(operation, args)
-    mail = UncertainEight()
+    mail = FailsEight("Outcome unknown: mutation was attempted. Do not retry automatically. Status verification failed")
     server = create_server(bridge=mail, state_dir=tmp_path)
     refs = [REF, {**REF, "message_id": 8}, {**REF, "message_id": 9}]
     result = call(server, "set_messages_status", {"refs": refs, "flagged": True})
     assert result["updated"] == 1 and result["stopped"] == "uncertain_write"
     assert result["results"][1]["retry_safe"] is False and "Inspect Mail" in result["results"][1]["error"]
-    assert [ref["message_id"] for ref in result["not_attempted"]] == [9]
-    assert [args["ref"]["message_id"] for op, args in mail.requests if op == "set_message_status"] == [7, 8]
+    assert result["not_attempted"] == [refs[2]]
+    marker, = tmp_path.glob("write-uncertain-*")
+    assert json.loads(marker.read_text())["target"] == [refs[1]]
 
 
 @pytest.mark.parametrize("discovered", [

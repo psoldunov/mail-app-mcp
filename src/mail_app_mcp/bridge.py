@@ -18,11 +18,14 @@ READ_OPERATIONS = frozenset({
 })
 # Opening a window cannot duplicate or lose mail, so its failures are never uncertain writes.
 UI_OPERATIONS = frozenset({"show_message"})
-WRITE_OPERATIONS = frozenset({"create_draft", "reply_draft", "set_message_status", "move_message"})
+WRITE_OPERATIONS = frozenset({"create_draft", "reply_draft", "set_message_status", "set_messages_status",
+                              "move_message", "move_messages"})
 OPERATIONS = READ_OPERATIONS | UI_OPERATIONS | WRITE_OPERATIONS
 PUBLIC_NAMES = {"save_attachment": "read_attachment"}
 MAX_RESPONSE = 2_000_000
-TIMEOUT_SECONDS = 60  # Drafts wait up to 30 s for Mail's saved copy, after lookups that slow down while Mail is busy.
+# Drafts wait up to 30 s for Mail's saved copy, and a batch starts writes for 30 s, after lookups that slow
+# down while Mail is busy.
+TIMEOUT_SECONDS = 60
 MAX_ERROR_DETAIL = 1000
 
 
@@ -99,19 +102,22 @@ def decode_response(output: str, *, operation: str | None = None) -> dict:
     if not isinstance(envelope, dict) or type(envelope.get("ok")) is not bool:
         raise uncertain_error("Mail returned an invalid response", operation)
     if not envelope["ok"]:
-        error = envelope.get("error")
-        number = envelope.get("apple_script_error_number")
-        if type(number) not in (int, float):
-            number = None
-        if isinstance(error, str) and error.startswith("Outcome unknown:"):
-            if operation in READ_OPERATIONS | UI_OPERATIONS:
-                error = error.removeprefix("Outcome unknown:").strip()
-            raise uncertain_error(error[:MAX_ERROR_DETAIL], operation, number)
-        raise BridgeError(error[:MAX_ERROR_DETAIL] if isinstance(error, str) else "Mail operation failed",
-                          operation=operation, apple_script_error_number=number)
+        raise failure(envelope.get("error"), envelope.get("apple_script_error_number"), operation)
     if not isinstance(envelope.get("result"), dict):
         raise uncertain_error("Mail returned an invalid result", operation)
     return envelope["result"]
+
+
+def failure(error, number, operation: str | None) -> BridgeError:
+    """The error the script reported, for a whole call or for one message of a batch."""
+    if type(number) not in (int, float):
+        number = None
+    if isinstance(error, str) and error.startswith("Outcome unknown:"):
+        if operation in READ_OPERATIONS | UI_OPERATIONS:
+            error = error.removeprefix("Outcome unknown:").strip()
+        return uncertain_error(error[:MAX_ERROR_DETAIL], operation, number)
+    return BridgeError(error[:MAX_ERROR_DETAIL] if isinstance(error, str) else "Mail operation failed",
+                       operation=operation, apple_script_error_number=number)
 
 
 def private_directory(path: Path) -> Path:
